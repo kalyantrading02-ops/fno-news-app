@@ -2,4 +2,3 @@ streamlit
 feedparser
 pandas
 python-dateutil
-streamlit-autorefresh
