@@ -35,8 +35,11 @@ since_date = datetime.now() - timedelta(days=days)
 st.sidebar.write(f"📅 Showing news since: {since_date.strftime('%d %b %Y')}")
 
 # --- News fetching
+from urllib.parse import quote
+
 def fetch_news(query):
-    url = f"https://news.google.com/rss/search?q={query}+stock+india"
+    safe_query = quote(f"{query} stock india")  # safely encode spaces and special chars
+    url = f"https://news.google.com/rss/search?q={safe_query}"
     feed = feedparser.parse(url)
     articles = []
     for entry in feed.entries:
