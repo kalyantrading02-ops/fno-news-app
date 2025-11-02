@@ -71,11 +71,11 @@ def fetch_news(query):
     return articles
 
 # ----------------- AUTO REFRESH -----------------
+from streamlit_autorefresh import st_autorefresh
+
 refresh_rate = st.sidebar.slider("⏱️ Auto-refresh every (minutes)", 0, 60, 0)
 if refresh_rate > 0:
-    st.sidebar.info(f"App will auto-refresh every {refresh_rate} minute(s).")
-    time.sleep(refresh_rate * 60)
-    st.experimental_rerun()
+    st_autorefresh(interval=refresh_rate * 60 * 1000, key="auto-refresh")
 
 # ----------------- FETCH BUTTON -----------------
 if st.button("🔍 Fetch Latest News"):
