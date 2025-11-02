@@ -74,7 +74,6 @@ def fetch_news(query):
 refresh_rate = st.sidebar.slider("⏱️ Auto-refresh every (minutes)", 0, 60, 0)
 if refresh_rate > 0:
     st.sidebar.info(f"App will auto-refresh every {refresh_rate} minute(s).")
-    st_autorefresh = st.experimental_rerun  # auto rerun alias
     time.sleep(refresh_rate * 60)
     st.experimental_rerun()
 
