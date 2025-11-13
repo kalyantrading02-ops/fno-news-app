@@ -1,6 +1,7 @@
 streamlit
-gnews
-textblob
 pandas
-matplotlib
 plotly
+gnews
+nltk
+# Optional (add to enable TextBlob sentiment)
+textblob
