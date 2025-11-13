@@ -1,4 +1,7 @@
 streamlit
-feedparser
 pandas
-python-dateutil
+plotly
+gnews
+nltk
+# Optional (add to enable TextBlob sentiment)
+textblob
