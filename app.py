@@ -38,12 +38,24 @@ if time.time() - st.session_state.last_refresh > 600:
 # --- Cached Data Fetch Function ---
 @st.cache_data(ttl=600)
 def fetch_stock_news(stock_name):
+    """Fetch news safely without breaking old layout."""
     try:
         articles = news_api.get_news(stock_name)
         if not articles:
             return pd.DataFrame(columns=["title", "published date", "link"])
+
         df = pd.DataFrame(articles)
-        return df[["title", "published date", "link"]]
+
+        # Fix for KeyError: "['link'] not in index"
+        required_cols = ["title", "published date", "link"]
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = None
+
+        df = df[required_cols]
+        df.dropna(subset=["title"], inplace=True)
+        return df
+
     except Exception as e:
         st.warning(f"⚠️ Error fetching news for {stock_name}: {e}")
         return pd.DataFrame(columns=["title", "published date", "link"])
