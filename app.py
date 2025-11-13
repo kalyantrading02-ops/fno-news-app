@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import plotly.graph_objects as go
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -17,30 +16,63 @@ from typing import List, Dict, Any, Optional
 import streamlit as st
 import time
 
-# ---- Silent Timed Refresh System (10 minutes) ----
-# Initialize session state
-if "last_refresh_time" not in st.session_state:
-    st.session_state.last_refresh_time = time.time()
+import streamlit as st
+from gnews import GNews
+from textblob import TextBlob
+import pandas as pd
+import time
 
-# Calculate time elapsed
-current_time = time.time()
-elapsed = current_time - st.session_state.last_refresh_time
+# --- Initialize News Fetcher ---
+news_api = GNews(language='en', country='IN', period='7d', max_results=20)
 
-# If 10 minutes passed → clear cache and refresh
-if elapsed > 600:  # 600 seconds = 10 minutes
+# --- Timed Refresh (10 minutes) ---
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = time.time()
+
+# Clear cache every 10 min
+if time.time() - st.session_state.last_refresh > 600:
     st.cache_data.clear()
-    st.session_state.last_refresh_time = current_time
-    st.toast("Data refreshed automatically (10 minutes elapsed).")
+    st.session_state.last_refresh = time.time()
+    st.toast("Data refreshed after 10 minutes ✅")
 
-# Display last updated info in sidebar
-mins_ago = int(elapsed // 60)
-st.sidebar.info(f"⏱️ Last updated: {mins_ago} minute(s) ago")
+# --- Cached Data Fetch Function ---
+@st.cache_data(ttl=600)
+def fetch_stock_news(stock_name):
+    try:
+        articles = news_api.get_news(stock_name)
+        if not articles:
+            return pd.DataFrame(columns=["title", "published date", "link"])
+        df = pd.DataFrame(articles)
+        return df[["title", "published date", "link"]]
+    except Exception as e:
+        st.warning(f"⚠️ Error fetching news for {stock_name}: {e}")
+        return pd.DataFrame(columns=["title", "published date", "link"])
 
-# ---- Your main app code below ----
-st.title("📊 Stock Market News & Sentiment Dashboard (Optimized)")
+# --- Cached Sentiment Analysis ---
+@st.cache_data(ttl=600)
+def get_sentiment(text):
+    if not text:
+        return "Neutral"
+    sentiment = TextBlob(text).sentiment.polarity
+    if sentiment > 0.1:
+        return "Positive"
+    elif sentiment < -0.1:
+        return "Negative"
+    else:
+        return "Neutral"
 
-# Example placeholder (keep your existing logic below)
-st.write("✅ Cached data loads instantly, auto-refreshes every 10 minutes silently.")
+# --- Example Usage ---
+st.title("⚡ Fast Stock Market News Dashboard")
+stock = st.text_input("Enter Stock Name", "Reliance Industries")
+
+if stock:
+    st.write(f"🔍 Fetching latest news for **{stock}** ...")
+    df = fetch_stock_news(stock)
+    if not df.empty:
+        df["Sentiment"] = df["title"].apply(get_sentiment)
+        st.dataframe(df)
+    else:
+        st.info("No recent news found.")
 
 # -----------------------------
 # INITIAL SETUP
