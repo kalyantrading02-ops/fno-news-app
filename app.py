@@ -14,6 +14,34 @@ from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import requests
 from typing import List, Dict, Any, Optional
 
+import streamlit as st
+import time
+
+# ---- Silent Timed Refresh System (10 minutes) ----
+# Initialize session state
+if "last_refresh_time" not in st.session_state:
+    st.session_state.last_refresh_time = time.time()
+
+# Calculate time elapsed
+current_time = time.time()
+elapsed = current_time - st.session_state.last_refresh_time
+
+# If 10 minutes passed → clear cache and refresh
+if elapsed > 600:  # 600 seconds = 10 minutes
+    st.cache_data.clear()
+    st.session_state.last_refresh_time = current_time
+    st.toast("Data refreshed automatically (10 minutes elapsed).")
+
+# Display last updated info in sidebar
+mins_ago = int(elapsed // 60)
+st.sidebar.info(f"⏱️ Last updated: {mins_ago} minute(s) ago")
+
+# ---- Your main app code below ----
+st.title("📊 Stock Market News & Sentiment Dashboard (Optimized)")
+
+# Example placeholder (keep your existing logic below)
+st.write("✅ Cached data loads instantly, auto-refreshes every 10 minutes silently.")
+
 # -----------------------------
 # INITIAL SETUP
 # -----------------------------
