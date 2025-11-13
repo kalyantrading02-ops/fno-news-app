@@ -1,132 +1,64 @@
+# app.py
 import time
 import re
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import plotly.graph_objects as go
+
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 from gnews import GNews
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
-import requests
+import requests  # NEW: used for Finnhub calendar fetch
 from typing import List, Dict, Any, Optional
-
-import streamlit as st
-import time
-
-import streamlit as st
-from gnews import GNews
-from textblob import TextBlob
-import pandas as pd
-import time
-
-# --- Initialize News Fetcher ---
-news_api = GNews(language='en', country='IN', period='7d', max_results=20)
-
-# --- Timed Refresh (10 minutes) ---
-if "last_refresh" not in st.session_state:
-    st.session_state.last_refresh = time.time()
-
-# Clear cache every 10 min
-if time.time() - st.session_state.last_refresh > 600:
-    st.cache_data.clear()
-    st.session_state.last_refresh = time.time()
-    st.toast("Data refreshed after 10 minutes ✅")
-
-# --- Cached Data Fetch Function ---
-@st.cache_data(ttl=600)
-def fetch_stock_news(stock_name):
-    """Fetch news safely without breaking old layout."""
-    try:
-        articles = news_api.get_news(stock_name)
-        if not articles:
-            return pd.DataFrame(columns=["title", "published date", "link"])
-
-        df = pd.DataFrame(articles)
-
-        # Fix for KeyError: "['link'] not in index"
-        required_cols = ["title", "published date", "link"]
-        for col in required_cols:
-            if col not in df.columns:
-                df[col] = None
-
-        df = df[required_cols]
-        df.dropna(subset=["title"], inplace=True)
-        return df
-
-    except Exception as e:
-        st.warning(f"⚠️ Error fetching news for {stock_name}: {e}")
-        return pd.DataFrame(columns=["title", "published date", "link"])
-
-# --- Cached Sentiment Analysis ---
-@st.cache_data(ttl=600)
-def get_sentiment(text):
-    if not text:
-        return "Neutral"
-    sentiment = TextBlob(text).sentiment.polarity
-    if sentiment > 0.1:
-        return "Positive"
-    elif sentiment < -0.1:
-        return "Negative"
-    else:
-        return "Neutral"
-
-# --- Example Usage ---
-st.title("⚡ Fast Stock Market News Dashboard")
-stock = st.text_input("Enter Stock Name", "Reliance Industries")
-
-if stock:
-    st.write(f"🔍 Fetching latest news for **{stock}** ...")
-    df = fetch_stock_news(stock)
-    if not df.empty:
-        df["Sentiment"] = df["title"].apply(get_sentiment)
-        st.dataframe(df)
-    else:
-        st.info("No recent news found.")
 
 # -----------------------------
 # INITIAL SETUP
 # -----------------------------
-# Download VADER lexicon once (quiet)
-try:
-    nltk.data.find("sentiment/vader_lexicon.zip")
-except Exception:
-    nltk.download("vader_lexicon", quiet=True)
-
+nltk.download("vader_lexicon", quiet=True)
 st.set_page_config(page_title="Stock News & Sentiment Dashboard", layout="wide")
 analyzer = SentimentIntensityAnalyzer()
 
 # -----------------------------
-# Utility: ISO date
+# FINNHUB: Upcoming Events Fetcher (NEW FEATURE)
 # -----------------------------
-
+# This is non-intrusive: used only in the Upcoming Events tab if user provides a key.
 def _iso_date(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
 
-# -----------------------------
-# Finnhub fetcher (kept, but not called by default)
-# -----------------------------
-
 def fetch_finnhub_economic_calendar(api_key: str, start: datetime, end: datetime, country: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Fetch economic calendar from Finnhub between start and end (inclusive).
+    Returns normalized list with keys: date (datetime or None), title, country, impact, raw.
+    """
     events = []
     if not api_key:
         return events
     url = "https://finnhub.io/api/v1/calendar/economic"
-    params = {"from": _iso_date(start), "to": _iso_date(end), "token": api_key}
+    params = {
+        "from": _iso_date(start),
+        "to": _iso_date(end),
+        "token": api_key
+    }
     try:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json() or {}
     except Exception as e:
+        # return empty and show error to user at UI time
         return [{"error": str(e)}]
 
+    # Finnhub returns a dict that may contain 'economic'
     raw_events = []
     if isinstance(data, dict):
         if "economic" in data and isinstance(data["economic"], list):
             raw_events = data["economic"]
         else:
+            # some responses might be list-like
             for v in data.values():
                 if isinstance(v, list):
                     raw_events = v
@@ -135,6 +67,7 @@ def fetch_finnhub_economic_calendar(api_key: str, start: datetime, end: datetime
         raw_events = data
 
     for ev in raw_events:
+        # attempt to read multiple possible keys
         date_raw = ev.get("date") or ev.get("eventDate") or ev.get("time") or ev.get("datetime")
         event_date = None
         try:
@@ -145,7 +78,13 @@ def fetch_finnhub_economic_calendar(api_key: str, start: datetime, end: datetime
         title = ev.get("title") or ev.get("event") or ev.get("name") or ev.get("description") or ""
         country_ev = (ev.get("country") or ev.get("countryCode") or "").upper()
         impact = ev.get("impact") or ev.get("importance") or ""
-        events.append({"date": event_date, "title": title, "country": country_ev, "impact": impact, "raw": ev})
+        events.append({
+            "date": event_date,
+            "title": title,
+            "country": country_ev,
+            "impact": impact,
+            "raw": ev
+        })
     if country:
         country_up = country.strip().upper()
         events = [e for e in events if not e.get("country") or e.get("country").startswith(country_up)]
@@ -153,7 +92,7 @@ def fetch_finnhub_economic_calendar(api_key: str, start: datetime, end: datetime
     return events
 
 # -----------------------------
-# SIDEBAR — SETTINGS
+# ORIGINAL APP: SIDEBAR — DARK MODE TOGGLE (kept)
 # -----------------------------
 st.sidebar.header("⚙️ Settings")
 try:
@@ -161,23 +100,8 @@ try:
 except Exception:
     dark_mode = st.sidebar.checkbox("🌗 Dark Mode", value=True, help="Switch instantly between Dark & Light Mode")
 
-st.sidebar.markdown("---")
-# Allow user to paste or upload a 200-stock list
-st.sidebar.subheader("Stocks list")
-use_full_list = st.sidebar.checkbox("Use full F&O list (paste/upload below)", value=False)
-stock_text = st.sidebar.text_area("Paste newline-separated stock/company names (when using full list)", height=120)
-uploaded = st.sidebar.file_uploader("Or upload CSV with one column of stock names", type=["csv", "txt"])
-
-# Caching preference
-st.sidebar.subheader("Performance")
-use_cache = st.sidebar.checkbox("Enable caching for news (faster reloads)", value=True)
-
-# Cleaner spacing / faster tabs preference
-st.sidebar.subheader("UI")
-ui_compact = st.sidebar.checkbox("Use slightly cleaner spacing & faster tabs", value=True)
-
 # -----------------------------
-# APPLY THEMES (CSS)
+# APPLY THEMES (CSS) (unchanged)
 # -----------------------------
 if dark_mode:
     bg_gradient = "linear-gradient(135deg, #0f2027, #203a43, #2c5364)"
@@ -190,8 +114,6 @@ else:
     accent_color = "#0078FF"
     plot_theme = "plotly_white"
 
-spacing_css = "padding:6px 0;" if ui_compact else "padding:10px 0;"
-
 st.markdown(
     f"""
 <style>
@@ -201,6 +123,7 @@ h1, h2, h3, h4, h5 {{ color: {accent_color} !important; }}
 .stButton button {{ background-color: {accent_color} !important; color: black !important; border-radius: 6px; }}
 .stDataFrame {{ border-radius: 10px; background-color: rgba(255,255,255,0.02); }}
 .news-card {{ border-radius: 10px; padding: 12px; box-shadow: 0 6px 18px rgba(0,0,0,0.12); transition: transform .12s ease, box-shadow .12s ease; background: rgba(255,255,255,0.02); margin-bottom: 12px; }}
+.news-card:hover {{ transform: translateY(-4px); box-shadow: 0 10px 30px rgba(0,0,0,0.16); }}
 .headline {{ font-weight:600; font-size:16px; margin-bottom:6px; }}
 .meta {{ font-size:12px; color: #9aa0a6; margin-bottom:8px; }}
 .snip {{ font-size:13px; color: #dfe6ea; }}
@@ -213,19 +136,18 @@ h1, h2, h3, h4, h5 {{ color: {accent_color} !important; }}
 .priority-med {{ background: rgba(255,193,7,0.08); color:#FFC107; padding:6px 10px; border-radius:8px; font-weight:600; }}
 .priority-low {{ background: rgba(128,128,128,0.06); color:#9aa0a6; padding:6px 10px; border-radius:8px; font-weight:600; }}
 .reason-chip {{ display:inline-block; margin:3px 4px; padding:4px 8px; border-radius:999px; font-size:12px; background: rgba(255,255,255,0.03); }}
-.section-compact {{ {spacing_css} }}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 # -----------------------------
-# APP TITLE
+# APP TITLE (unchanged)
 # -----------------------------
 st.title("💹 Stock Market News & Sentiment Dashboard")
 
 # -----------------------------
-# AUTO REFRESH (kept but safer)
+# AUTO REFRESH EVERY 10 MIN (robust) (unchanged)
 # -----------------------------
 refresh_interval = 600  # 10 minutes
 if "last_refresh" not in st.session_state:
@@ -234,19 +156,19 @@ else:
     if time.time() - st.session_state["last_refresh"] > refresh_interval:
         st.session_state["last_refresh"] = time.time()
         try:
-            st.experimental_rerun()
+            st.rerun()
         except Exception:
             try:
-                st.rerun()
+                st.experimental_rerun()
             except Exception:
                 st.warning("Auto-refresh is unavailable in this Streamlit version. Please refresh manually.")
                 st.stop()
 
 # -----------------------------
-# Sidebar filters
+# SIDEBAR FILTERS (unchanged)
 # -----------------------------
 st.sidebar.header("📅 Filter Options")
-time_period = st.sidebar.selectbox("Select Time Period", ["Last Week", "Last Month", "Last 3 Months", "Last 6 Months"]) 
+time_period = st.sidebar.selectbox("Select Time Period", ["Last Week", "Last Month", "Last 3 Months", "Last 6 Months"])
 
 today = datetime.today()
 if time_period == "Last Week":
@@ -259,61 +181,47 @@ else:
     start_date = today - timedelta(days=180)
 
 # -----------------------------
-# F&O STOCK LIST (default small sample)
-# User can paste/upload full 200 list via sidebar above
+# F&O STOCK LIST (unchanged)
 # -----------------------------
-DEFAULT_FO_STOCKS = [
-    "Reliance Industries", "TCS", "Infosys", "HDFC Bank", "ICICI Bank", "State Bank of India",
-    "HCL Technologies", "Wipro", "Larsen & Toubro", "Tata Motors", "Bajaj Finance", "Axis Bank",
-    "NTPC", "ITC", "Adani Enterprises", "Coal India", "Power Grid", "Maruti Suzuki", "Tech Mahindra", "Sun Pharma",
+fo_stocks = [
+    "Reliance Industries",
+    "TCS",
+    "Infosys",
+    "HDFC Bank",
+    "ICICI Bank",
+    "State Bank of India",
+    "HCL Technologies",
+    "Wipro",
+    "Larsen & Toubro",
+    "Tata Motors",
+    "Bajaj Finance",
+    "Axis Bank",
+    "NTPC",
+    "ITC",
+    "Adani Enterprises",
+    "Coal India",
+    "Power Grid",
+    "Maruti Suzuki",
+    "Tech Mahindra",
+    "Sun Pharma",
 ]
 
-# Build final stock list
-fo_stocks = DEFAULT_FO_STOCKS.copy()
-# Add from uploaded file
-if uploaded is not None:
-    try:
-        df_up = pd.read_csv(uploaded, header=None)
-        vals = df_up.iloc[:, 0].astype(str).str.strip().tolist()
-        fo_stocks = [v for v in vals if v]
-    except Exception:
-        try:
-            txt = uploaded.getvalue().decode("utf-8")
-            vals = [l.strip() for l in txt.splitlines() if l.strip()]
-            fo_stocks = vals
-        except Exception:
-            st.sidebar.error("Uploaded file could not be parsed. Please paste the list instead.")
-
-# Add from pasted text if requested
-if use_full_list and stock_text.strip():
-    pasted = [l.strip() for l in stock_text.splitlines() if l.strip()]
-    if pasted:
-        fo_stocks = pasted
-
-# If user enabled full list but provided none, show guidance
-if use_full_list and not fo_stocks:
-    st.sidebar.warning("Full list selected but no stocks provided — please paste names or upload CSV.")
-
 # -----------------------------
-# FETCHERS & CACHING
-# - Use st.cache_data for news fetcher; controlled by sidebar toggle
+# FETCHERS (cached) (unchanged)
 # -----------------------------
-
-# Provide wrapper to optionally use cache
-if use_cache:
-    cache_decorator = st.cache_data
-else:
-    # no-op decorator fallback
-    def cache_decorator(ttl=None, show_spinner=True):
-        def inner(f):
-            return f
-        return inner
-
-@cache_decorator(ttl=300, show_spinner=False)
-def fetch_news(stock, start, end, max_results=30):
+# -----------------------------
+# REPLACE existing fetch_news() with this improved live fetcher
+# - Removes the tiny artificial cap
+# - Deduplicates headlines (by normalized title) so counts reflect unique articles
+# - Returns [] when no articles found so stocks can show 0
+# -----------------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_news(stock, start, end, max_results=50):
     """
-    Fetch news for a stock with deduplication and robust error handling.
-    Cached by (stock, start, end, max_results) when caching is enabled.
+    Fetch news for `stock` using GNews.
+    - Default max_results increased to 50 to allow real variation.
+    - Deduplicates articles based on normalized title to avoid duplicates.
+    - Returns a list of article dicts (may be empty).
     """
     try:
         gnews = GNews(language="en", country="IN", max_results=max_results)
@@ -326,12 +234,17 @@ def fetch_news(stock, start, end, max_results=30):
         if not raw:
             return []
 
+        # Normalize and dedupe by headline/title to avoid duplicate hits
         seen = set()
         unique_articles = []
         for art in raw:
             title = (art.get("title") or "").strip()
+            # normalized key - remove non-word and lowercase
             norm = re.sub(r'\W+', " ", title.lower()).strip()
-            key = norm[:200] if norm else json.dumps(art, sort_keys=True)[:120]
+            if not norm:
+                key = json.dumps(art, sort_keys=True)[:120]
+            else:
+                key = norm[:200]
             if key in seen:
                 continue
             seen.add(key)
@@ -339,50 +252,27 @@ def fetch_news(stock, start, end, max_results=30):
 
         return unique_articles
     except Exception:
+        # On any fetch error, return empty list so the UI shows 0 count
         return []
 
-
-@cache_decorator(ttl=600, show_spinner=False)
-def fetch_all_news(stocks: List[str], start: datetime, end: datetime, max_results_per_stock: int = 30):
-    """
-    Fetch all news concurrently for a list of stocks. Returns list of dicts {Stock, Articles, News Count}.
-    Uses a controlled ThreadPoolExecutor to avoid extreme resource use when fetching 200 stocks.
-    """
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_all_news(stocks, start, end):
     results = []
-    # cap workers sensibly depending on number of stocks
-    workers = min(15, max(4, len(stocks) // 5))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(fetch_news, s, start, end, max_results_per_stock): s for s in stocks}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_news, s, start, end): s for s in stocks}
         for future in as_completed(futures):
             stock = futures[future]
             try:
                 articles = future.result() or []
-                # Only keep articles with publisher/title to avoid waste
-                filtered = []
-                for art in articles:
-                    pub = art.get("publisher")
-                    pub_title = ""
-                    if isinstance(pub, dict):
-                        pub_title = (pub.get("title") or "").strip()
-                    elif isinstance(pub, str):
-                        pub_title = pub.strip()
-                    else:
-                        pub_title = (art.get("source") or "").strip()
-                    if pub_title:
-                        if not isinstance(pub, dict):
-                            art["publisher"] = {"title": pub_title}
-                        else:
-                            art["publisher"]["title"] = pub_title
-                        filtered.append(art)
-                results.append({"Stock": stock, "Articles": filtered, "News Count": len(filtered)})
+                results.append({"Stock": stock, "Articles": articles, "News Count": len(articles)})
             except Exception:
                 results.append({"Stock": stock, "Articles": [], "News Count": 0})
     return results
 
-# -----------------------------
-# Sentiment helper
-# -----------------------------
 
+# -----------------------------
+# SENTIMENT helper (unchanged)
+# -----------------------------
 def analyze_sentiment(text):
     if not text:
         text = ""
@@ -394,8 +284,9 @@ def analyze_sentiment(text):
     else:
         return "Neutral", "🟡", score
 
+
 # -----------------------------
-# Scoring engine (kept unchanged)
+# SCORING ENGINE CONFIG (unchanged)
 # -----------------------------
 WEIGHTS = {
     "earnings_guidance": 30,
@@ -424,7 +315,22 @@ HIGH_PRIORITY_KEYWORDS = {
     "block": ["block deal", "bulk deal", "blocktrade", "block-trade", "insider", "promoter buy", "promoter selling", "promoter sell"],
 }
 
-TRUSTED_SOURCES = {"reuters", "bloomberg", "economic times", "economictimes", "livemint", "mint", "business standard", "business-standard", "cnbc", "ft", "financial times", "press release", "nse", "bse"}
+TRUSTED_SOURCES = {
+    "reuters",
+    "bloomberg",
+    "economic times",
+    "economictimes",
+    "livemint",
+    "mint",
+    "business standard",
+    "business-standard",
+    "cnbc",
+    "ft",
+    "financial times",
+    "press release",
+    "nse",
+    "bse",
+}
 LOW_QUALITY_SOURCES = {"blog", "medium", "wordpress", "forum", "reddit", "quora"}
 SPECULATIVE_WORDS = ["may", "might", "could", "rumour", "rumor", "reportedly", "alleged", "possible", "speculat"]
 NUMERIC_PATTERN = r'[%₹$£€]|(?:\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b\s*(?:crore|lakh|billion|bn|mn|m|₹|rs\.|rs|rupee|ton|tons|mw|MW|GW))'
@@ -515,37 +421,62 @@ def score_article(title, desc, publisher, corroboration_sources=None):
     score = int(max(0, min(100, raw + corroboration_bonus)))
     return score, reasons
 
+
 # -----------------------------
-# Session defaults (kept)
+# Ensure watchlist & manual events exist in session (unchanged)
 # -----------------------------
 st.session_state.setdefault("saved_articles", [])
 st.session_state.setdefault("manual_events", [])
 
 # -----------------------------
-# Utility: extract headline map from results for corroboration
+# FETCH RAW NEWS & PREPARE NEWS_RESULTS & HEADLINE MAP (unchanged)
 # -----------------------------
+with st.spinner("Fetching latest financial news..."):
+    raw_news_results = fetch_all_news(fo_stocks[:10], start_date, today)
 
-def build_headline_map(news_results: List[Dict[str, Any]]):
-    headline_map = {}
-    for res in news_results:
-        stock = res.get("Stock", "Unknown")
-        for art in res.get("Articles", []) or []:
-            title = art.get("title") or ""
-            norm_head = re.sub(r'\W+', " ", title.lower()).strip()
-            key = norm_head[:120] if norm_head else f"{stock.lower()}_{(title or '')[:40]}"
-            pub = art.get("publisher")
-            pub_name = ""
-            if isinstance(pub, dict):
-                pub_name = pub.get("title") or ""
-            elif isinstance(pub, str):
-                pub_name = pub
+# Filter to only keep articles with visible publisher / source (same logic as before)
+news_results = []
+for r in raw_news_results:
+    stock = r.get("Stock", "")
+    articles = r.get("Articles", []) or []
+    filtered_articles = []
+    for art in articles:
+        pub_field = art.get("publisher")
+        pub_title = ""
+        if isinstance(pub_field, dict):
+            pub_title = (pub_field.get("title") or "").strip()
+        elif isinstance(pub_field, str):
+            pub_title = pub_field.strip()
+        else:
+            pub_title = (art.get("source") or "").strip()
+        if pub_title:
+            if not isinstance(pub_field, dict):
+                art["publisher"] = {"title": pub_title}
             else:
-                pub_name = art.get("source") or ""
-            headline_map.setdefault(key, []).append(pub_name or "unknown")
-    return headline_map
+                art["publisher"]["title"] = pub_title
+            filtered_articles.append(art)
+    news_results.append({"Stock": stock, "Articles": filtered_articles, "News Count": len(filtered_articles)})
+
+# Build headline -> publishers map for corroboration (same as original)
+headline_map = {}
+for res in news_results:
+    stock = res.get("Stock", "Unknown")
+    for art in res.get("Articles", []) or []:
+        title = art.get("title") or ""
+        norm_head = re.sub(r'\W+', " ", title.lower()).strip()
+        key = norm_head[:120] if norm_head else f"{stock.lower()}_{(title or '')[:40]}"
+        pub = art.get("publisher")
+        pub_name = ""
+        if isinstance(pub, dict):
+            pub_name = pub.get("title") or ""
+        elif isinstance(pub, str):
+            pub_name = pub
+        else:
+            pub_name = art.get("source") or ""
+        headline_map.setdefault(key, []).append(pub_name or "unknown")
 
 # -----------------------------
-# EVENT extraction utilities (kept)
+# Extract upcoming events from news (unchanged)
 # -----------------------------
 EVENT_WINDOW_DAYS = 90
 EVENT_KEYWORDS = {
@@ -566,7 +497,6 @@ DATE_PATTERNS = [
     r'\b(next week|next month|tomorrow|today|this week|this month)\b'
 ]
 
-
 def try_parse_date(s):
     s = (s or "").strip()
     if not s:
@@ -586,7 +516,6 @@ def try_parse_date(s):
                 continue
     return None
 
-
 def text_for_search(art):
     parts = []
     if art.get("title"):
@@ -597,102 +526,100 @@ def text_for_search(art):
         parts.append(art.get("snippet"))
     return " ".join(parts or [""]).lower()
 
-
-def extract_events_from_news(news_results):
-    events = []
-    for res in news_results:
-        stock = res.get("Stock", "Unknown")
-        for art in res.get("Articles", []) or []:
-            txt = text_for_search(art)
-            if not txt.strip():
-                continue
-            matched_types = []
-            for etype, kws in EVENT_KEYWORDS.items():
-                for kw in kws:
-                    if kw in txt:
-                        matched_types.append(etype)
-                        break
-            if not matched_types:
-                continue
-            found_dates = []
-            for patt in DATE_PATTERNS:
-                for m in re.finditer(patt, txt, flags=re.IGNORECASE):
-                    cand = m.group(0)
-                    parsed = try_parse_date(cand)
-                    if parsed:
-                        found_dates.append(parsed)
-                    else:
-                        rel = cand.lower()
-                        now = datetime.now()
-                        if "tomorrow" in rel:
-                            found_dates.append(now + timedelta(days=1))
-                        elif "today" in rel:
-                            found_dates.append(now)
-                        elif "next week" in rel:
-                            found_dates.append(now + timedelta(days=7))
-                        elif "next month" in rel:
-                            found_dates.append(now + timedelta(days=30))
-            if not found_dates:
-                m = re.search(r'on ([A-Za-z0-9 ,\-thstndrd]{3,30})', txt)
-                if m:
-                    cand = m.group(1)
-                    parsed = try_parse_date(cand)
-                    if parsed:
-                        found_dates.append(parsed)
-            for dt in found_dates:
-                if not isinstance(dt, datetime):
-                    continue
-                if dt.date() < datetime.now().date():
-                    continue
-                if (dt - datetime.now()).days > EVENT_WINDOW_DAYS:
-                    continue
-                etype_label = matched_types[0] if matched_types else "update"
-                desc = art.get("title") or art.get("description") or ""
-                pub = art.get("publisher")
-                source = ""
-                if isinstance(pub, dict):
-                    source = pub.get("title") or ""
+events = []
+for res in news_results:
+    stock = res.get("Stock", "Unknown")
+    for art in res.get("Articles", []) or []:
+        txt = text_for_search(art)
+        if not txt.strip():
+            continue
+        matched_types = []
+        for etype, kws in EVENT_KEYWORDS.items():
+            for kw in kws:
+                if kw in txt:
+                    matched_types.append(etype)
+                    break
+        if not matched_types:
+            continue
+        found_dates = []
+        for patt in DATE_PATTERNS:
+            for m in re.finditer(patt, txt, flags=re.IGNORECASE):
+                cand = m.group(0)
+                parsed = try_parse_date(cand)
+                if parsed:
+                    found_dates.append(parsed)
                 else:
-                    source = pub or art.get("source") or ""
-                url = art.get("url") or art.get("link") or "#"
+                    rel = cand.lower()
+                    now = datetime.now()
+                    if "tomorrow" in rel:
+                        found_dates.append(now + timedelta(days=1))
+                    elif "today" in rel:
+                        found_dates.append(now)
+                    elif "next week" in rel:
+                        found_dates.append(now + timedelta(days=7))
+                    elif "next month" in rel:
+                        found_dates.append(now + timedelta(days=30))
+        if not found_dates:
+            m = re.search(r'on ([A-Za-z0-9 ,\-thstndrd]{3,30})', txt)
+            if m:
+                cand = m.group(1)
+                parsed = try_parse_date(cand)
+                if parsed:
+                    found_dates.append(parsed)
+        for dt in found_dates:
+            if not isinstance(dt, datetime):
+                continue
+            if dt.date() < datetime.now().date():
+                continue
+            if (dt - datetime.now()).days > EVENT_WINDOW_DAYS:
+                continue
+            etype_label = matched_types[0] if matched_types else "update"
+            desc = art.get("title") or art.get("description") or ""
+            pub = art.get("publisher")
+            source = ""
+            if isinstance(pub, dict):
+                source = pub.get("title") or ""
+            else:
+                source = pub or art.get("source") or ""
+            url = art.get("url") or art.get("link") or "#"
+            priority = "Normal"
+            try:
+                if is_trusted(source):
+                    priority = "High"
+            except Exception:
                 priority = "Normal"
-                try:
-                    if is_trusted(source):
-                        priority = "High"
-                except Exception:
-                    priority = "Normal"
-                events.append({"stock": stock, "type": etype_label, "desc": desc, "date": dt, "source": source, "url": url, "priority": priority})
+            events.append({"stock": stock, "type": etype_label, "desc": desc, "date": dt, "source": source, "url": url, "priority": priority})
 
-    # dedupe events by (stock, type, date)
-    unique = {}
-    for e in events:
-        key = (e["stock"], e["type"], e["date"].date())
-        if key not in unique:
-            unique[key] = e
-        else:
-            existing = unique[key]
-            if e["source"] and e["source"] not in existing.get("source", ""):
-                existing["source"] += f"; {e['source']}"
-    events = sorted(unique.values(), key=lambda x: (x["date"], x["priority"] == "High"))
+# dedupe events by (stock, type, date)
+unique = {}
+for e in events:
+    key = (e["stock"], e["type"], e["date"].date())
+    if key not in unique:
+        unique[key] = e
+    else:
+        existing = unique[key]
+        if e["source"] and e["source"] not in existing.get("source", ""):
+            existing["source"] += f"; {e['source']}"
+events = sorted(unique.values(), key=lambda x: (x["date"], x["priority"] == "High"))
 
-    # include manual events from session
-    manual = st.session_state.get("manual_events", [])
-    for me in manual:
-        events.append({"stock": me.get("stock", "Manual"), "type": me.get("type", "manual"), "desc": me.get("desc", ""), "date": me.get("date"), "source": "Manual", "url": "#", "priority": me.get("priority", "Normal")})
-    events = sorted(events, key=lambda x: (x["date"] if isinstance(x["date"], datetime) else datetime.max))
-    return events
+# include manual events from session
+manual = st.session_state.get("manual_events", [])
+for me in manual:
+    events.append({"stock": me.get("stock", "Manual"), "type": me.get("type", "manual"), "desc": me.get("desc", ""), "date": me.get("date"), "source": "Manual", "url": "#", "priority": me.get("priority", "Normal")})
+events = sorted(events, key=lambda x: (x["date"] if isinstance(x["date"], datetime) else datetime.max))
 
 # -----------------------------
-# MAIN TABS (lazy load heavy fetches inside tabs)
+# MAIN TABS (unchanged)
 # -----------------------------
-news_tab, trending_tab, sentiment_tab, events_tab = st.tabs(["📰 News", "🔥 Trending Stocks", "💬 Sentiment", "📅 Upcoming Events"]) 
+news_tab, trending_tab, sentiment_tab, events_tab = st.tabs(["📰 News", "🔥 Trending Stocks", "💬 Sentiment", "📅 Upcoming Events"])
 
 # -----------------------------
-# TAB 1 — NEWS (lazy fetch)
+# TAB 1 — NEWS (unchanged)
 # -----------------------------
 with news_tab:
     st.header("🗞️ Latest Market News for F&O Stocks")
 
+    # Controls for News tab
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         only_impact = st.checkbox("🔎 Show only market-impacting news (score ≥ threshold)", value=True)
@@ -703,14 +630,7 @@ with news_tab:
 
     st.markdown("---")
 
-    # Fetch news (cached) only when this tab runs
-    with st.spinner("Fetching latest financial news (this may take a moment for large lists)..."):
-        raw_news_results = fetch_all_news(fo_stocks, start_date, today, max_results_per_stock=25)
-
-    # Build headline map for corroboration
-    news_results = raw_news_results
-    headline_map = build_headline_map(news_results)
-
+    # Now show the regular news (expanders per stock), filtered and scored
     displayed_total = 0
     filtered_out_total = 0
 
@@ -745,6 +665,7 @@ with news_tab:
 
         with st.expander(f"🔹 {stock} ({len(visible)} Articles shown, scanned {len(scored_list)})", expanded=False):
             if visible:
+                # iterate with index so we can build unique keys
                 for idx, art in enumerate(visible[:10]):
                     title = art["title"]
                     url = art["url"]
@@ -772,6 +693,7 @@ with news_tab:
                         snippet = art["desc"] if len(art["desc"]) < 220 else art["desc"][:217] + "..."
                         st.markdown(f"> {snippet}")
 
+                    # safe unique key: stock_sanitized + idx + url hash
                     safe_stock = re.sub(r'\W+', '_', stock.lower())
                     save_key = f"save_{safe_stock}_{idx}_{abs(hash(url))}"
 
@@ -799,22 +721,26 @@ with news_tab:
         st.info("No saved articles yet — click 💾 Save / Watch on any article card.")
 
 # -----------------------------
-# TAB 2 — TRENDING (lazy fetch)
+# TAB 2 — TRENDING (market-impacting news only)
 # -----------------------------
 with trending_tab:
     st.header(f"🔥 Trending F&O Stocks by Market-Impacting News — {time_period}")
+
+    # Choose threshold for "market-impacting" — change this number if you want stricter/looser filtering
     impact_threshold = 40
 
-    with st.spinner("Computing trending stocks..."):
-        all_results = fetch_all_news(fo_stocks, start_date, today, max_results_per_stock=20)
-        headline_map = build_headline_map(all_results)
+    with st.spinner("Fetching latest news and filtering for market-impacting items..."):
+        # fetch raw news lists (deduped by fetch_news function)
+        all_results = fetch_all_news(fo_stocks, start_date, today)
 
+        # Build counts by counting only articles with score >= impact_threshold
         counts = []
         for res in all_results:
             stock_name = res.get("Stock", "")
             articles = res.get("Articles") or []
             impactful_count = 0
             for art in articles:
+                # prepare title/desc/publisher similar to News tab logic
                 title = art.get("title") or ""
                 desc = art.get("description") or art.get("snippet") or ""
                 pub_field = art.get("publisher")
@@ -824,19 +750,26 @@ with trending_tab:
                     publisher = pub_field
                 else:
                     publisher = art.get("source") or ""
+
+                # build headline key for corroboration lookup (reuse your headline_map)
                 norm_head = re.sub(r'\W+', " ", (title or "").lower()).strip()
                 key = norm_head[:120] if norm_head else f"{stock_name.lower()}_{(title or '')[:40]}"
                 publishers_for_head = headline_map.get(key, [])
+
+                # score article using your scoring engine; count if above threshold
                 score, reasons = score_article(title, desc, publisher, corroboration_sources=publishers_for_head)
                 if score >= impact_threshold:
                     impactful_count += 1
+
             counts.append({"Stock": stock_name, "News Count": int(impactful_count)})
 
         df_counts = pd.DataFrame(counts).sort_values("News Count", ascending=False).reset_index(drop=True)
 
+    # If no data, show message
     if df_counts.empty:
-        st.info("No data available — try changing the time period or paste/upload a full list of stocks.")
+        st.info("No data available — try changing the time period or increasing max_results in fetcher.")
     else:
+        # If everything is zero, show raw zeros; otherwise compute relative percent (top = 100%)
         if df_counts["News Count"].sum() == 0:
             df_counts["Label"] = df_counts["News Count"].astype(str)
             y_field = "News Count"
@@ -850,64 +783,79 @@ with trending_tab:
             hover_template_extra = "%{y:.1f}%"
             yaxis_title = "Relative Popularity (%) (top = 100%)"
 
-        # build colors (single-color palette for clarity and faster rendering)
-        palette = [accent_color]
-        colors = [palette[0] for _ in range(len(df_counts))]
+        # Palette (one color per bar); change to single color by replacing colors list if desired
+        palette = ["#0078FF", "#00C853", "#EF5350", "#9C27B0", "#FF9800", "#00BCD4", "#8BC34A", "#9E9E9E"]
+        colors = [palette[i % len(palette)] for i in range(len(df_counts))]
 
+        # Build Plotly bar chart
         fig = go.Figure()
         fig.add_trace(go.Bar(
             x=df_counts["Stock"],
             y=df_counts[y_field],
-            marker=dict(color=colors, line=dict(color='rgba(0,0,0,0.12)', width=0.6)),
+            marker=dict(color=colors, line=dict(color='rgba(0,0,0,0.4)', width=1.25)),
             text=df_counts["Label"],
             textposition='outside',
             hovertemplate='<b>%{x}</b><br>Value: ' + hover_template_extra + '<extra></extra>',
         ))
 
+        # Layout & style
         fig.update_layout(
             template=plot_theme,
-            title=dict(text=f"Trending F&O Stocks (market-impacting news only) — {time_period}", x=0.5, xanchor='center', font=dict(size=16)),
+            title=dict(text=f"Trending F&O Stocks (market-impacting news only) — {time_period}", x=0.5, xanchor='center', font=dict(size=18)),
             plot_bgcolor='rgba(0,0,0,0)',
             paper_bgcolor='rgba(0,0,0,0)',
             margin=dict(t=70, l=60, r=40, b=120),
-            height=480,
+            height=520,
         )
 
-        fig.update_xaxes(tickangle=-35, tickfont=dict(size=10), showgrid=False, zeroline=False)
-        fig.update_yaxes(showgrid=True, gridcolor='rgba(255,255,255,0.08)', tickfont=dict(size=11), title_text=yaxis_title, rangemode="tozero")
+        fig.update_xaxes(tickangle=-35, tickfont=dict(size=11), showgrid=False, zeroline=False)
+        fig.update_yaxes(showgrid=True, gridcolor='rgba(255,255,255,0.08)', tickfont=dict(size=12), title_text=yaxis_title, rangemode="tozero")
 
-        fig.update_traces(textfont=dict(size=11, color="#ffffff" if dark_mode else "#111111"), cliponaxis=False)
+        fig.update_traces(textfont=dict(size=12, color="#ffffff" if dark_mode else "#111111"), cliponaxis=False)
 
         if dark_mode:
             fig.update_layout(font=dict(color="#EAEAEA"))
         else:
             fig.update_layout(font=dict(color="#111111"))
 
+        # Render chart and table
         st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("📊 Market-impacting News Summary")
 
-    df_display = df_counts[["Stock", "News Count"]].copy()
-    if "Percent" in df_counts.columns:
-        df_display["Percent"] = df_counts["Percent"].round(1)
+df_display = df_counts[["Stock", "News Count"]].copy()
+if y_field == "Percent":
+    df_display["Percent"] = df_counts["Percent"].round(1)
 
-    st.dataframe(df_display, use_container_width=True)
+# ✅ Center only the numeric columns (News Count and Percent)
+st.dataframe(
+    df_display.style.set_properties(
+        subset=["News Count"] + (["Percent"] if "Percent" in df_display.columns else []),
+        **{"text-align": "center"}
+    ),
+    use_container_width=True
+)
 
-    top_nonzero = df_counts[df_counts["News Count"] > 0].head(3)
-    if not top_nonzero.empty:
-        st.success(f"🚀 Top Trending (market-impacting): {', '.join(top_nonzero['Stock'].tolist())}")
-        st.caption(f"Showing articles with score ≥ {impact_threshold}. Adjust `impact_threshold` in the code to tune sensitivity.")
-    else:
-        st.info("No market-impacting news found in the selected timeframe (all counts are 0).")
+# 🟢 Top trending stocks (market-impacting only)
+top_nonzero = df_counts[df_counts["News Count"] > 0].head(3)
+if not top_nonzero.empty:
+    st.success(
+        f"🚀 Top Trending (market-impacting): {', '.join(top_nonzero['Stock'].tolist())}"
+    )
+    st.caption(
+        f"Showing articles with score ≥ {impact_threshold}. Adjust `impact_threshold` in the code to tune sensitivity."
+    )
+else:
+    st.info("No market-impacting news found in the selected timeframe (all counts are 0).")
 
 # -----------------------------
-# TAB 3 — SENTIMENT (lazy fetch)
+# TAB 3 — SENTIMENT (unchanged)
 # -----------------------------
 with sentiment_tab:
     st.header("💬 Sentiment Analysis")
     with st.spinner("Analyzing sentiment..."):
         sentiment_data = []
-        all_results = fetch_all_news(fo_stocks[:50], start_date, today, max_results_per_stock=10)
+        all_results = fetch_all_news(fo_stocks[:10], start_date, today)
         for res in all_results:
             stock = res.get("Stock", "Unknown")
             for art in res.get("Articles", [])[:3]:
@@ -925,16 +873,12 @@ with sentiment_tab:
             st.warning("No sentiment data found for the selected timeframe.")
 
 # -----------------------------
-# TAB 4 — UPCOMING EVENTS
+# TAB 4 — UPCOMING EVENTS (Only company/corporate events — Finnhub removed)
 # -----------------------------
 with events_tab:
-    # Extract events from news lazily (faster)
-    st.subheader(f"📅 Upcoming Market-Moving Events (next {EVENT_WINDOW_DAYS} days)")
-    with st.spinner("Extracting events from news headlines..."):
-        # reuse smaller fetch to reduce cost
-        results_for_events = fetch_all_news(fo_stocks[:80], start_date, today, max_results_per_stock=15)
-        events = extract_events_from_news(results_for_events)
+    st.subheader(f"📅 Upcoming Market-Moving Events (next {EVENT_WINDOW_DAYS} days) — {len(events)} found (from news)")
 
+    # ---- Show original extracted events from news (company / corporate events) ----
     st.markdown("### Events extracted from news headlines (company / corporate events)")
     if events:
         rows = []
@@ -949,13 +893,19 @@ with events_tab:
             })
         df_events = pd.DataFrame(rows)
         st.dataframe(df_events, use_container_width=True)
-        st.download_button("📥 Download Extracted Events (CSV)", df_events.to_csv(index=False).encode("utf-8"), "extracted_events.csv", "text/csv")
+        st.download_button(
+            "📥 Download Extracted Events (CSV)",
+            df_events.to_csv(index=False).encode("utf-8"),
+            "extracted_events.csv",
+            "text/csv"
+        )
         for e in events[:10]:
             date_str = e["date"].strftime("%Y-%m-%d") if isinstance(e["date"], datetime) else str(e["date"])
             st.markdown(f"- **{e['stock']}** — *{e['type'].title()}* on **{date_str}** — *{e['priority']}* — [{e['source']}]({e['url']})")
     else:
         st.info("No upcoming company updates found from recent news. Add manually if needed.")
 
+    # ---- Manual Add Section (unchanged) ----
     with st.expander("➕ Add manual event"):
         m_stock = st.text_input("Stock name / company")
         m_type = st.selectbox(
@@ -977,9 +927,7 @@ with events_tab:
             st.success("Manual event added (session only). It will appear in Upcoming Events on next refresh.")
 
 # -----------------------------
-# FOOTER
+# FOOTER (unchanged)
 # -----------------------------
 st.markdown("---")
 st.caption(f"📊 Data Source: Google News | Mode: {'Dark' if dark_mode else 'Light'} | Auto-refresh every 10 min | Built with ❤️ using Streamlit & Plotly")
-
-# End of file
