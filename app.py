@@ -578,27 +578,18 @@ with news_tab:
 # TAB: TRENDING (fixed & robust) - includes RBI implicitly via all_results if wanted
 # -----------------------------
 with trending_tab:
-    st.header(f"🔥 Trending F&O Stocks — Impact from recent news ({time_period})")
+    st.header(f"🔥 Trending F&O Stocks — News Impact ({time_period})")
 
     st.markdown(
         "This chart shows the **real effect** of news on each F&O stock for the selected time window. "
-        "Bars = summed impact score (higher = more/stronger signals). Line & markers = relative effect vs top stock (top = 100%)."
+        "Bars = summed impact score (higher = more/stronger signals). Line = relative effect vs top stock (top = 100%)."
     )
 
     # Fetch full news for all F&O stocks (on-demand)
     with st.spinner("Calculating news impact across F&O stocks..."):
-        all_results = fetch_all_news(fo_stocks, start_date, today, max_results_local=max_results)
+        all_results = fetch_all_news(fo_stocks, start_date, today, max_results=40)
 
-    # Optionally fetch RBI hits and include them in all_results for Trending
-    try:
-        rbi_for_trending = fetch_rbi_news(start_date, today, max_results_local=max_results) or []
-        if rbi_for_trending:
-            # add as first element
-            all_results.insert(0, {"Stock": "RBI (Policy)", "Articles": rbi_for_trending, "News Count": len(rbi_for_trending)})
-    except Exception:
-        pass
-
-    # Rebuild corroboration map from the same dataset
+    # Build corroboration map
     headline_map_full = {}
     for res in all_results:
         stock = res.get("Stock", "")
@@ -616,7 +607,7 @@ with trending_tab:
                 pub_name = art.get("source") or ""
             headline_map_full.setdefault(key, []).append(pub_name or "unknown")
 
-    # Aggregate metrics per stock (sum of article scores, article count, avg score)
+    # Aggregate metrics
     metrics = []
     for res in all_results:
         stock = res.get("Stock", "")
@@ -638,13 +629,6 @@ with trending_tab:
             key = norm_head[:120] if norm_head else f"{stock.lower()}_{(title or '')[:40]}"
             pubs = headline_map_full.get(key, [])
             score, reasons = score_article(title, desc, publisher, corroboration_sources=pubs)
-            # RBI boost if RBI keyword present
-            title_l = (title or "").lower()
-            desc_l = (desc or "").lower()
-            if any(k in title_l or k in desc_l for k in RBI_KEYWORDS):
-                score = min(100, score + 30)
-                reasons = reasons + ["RBI mention (boosted)"]
-            # accumulate
             sum_score += score
             if title:
                 sample_titles.append({"title": title, "score": score, "publisher": publisher})
@@ -656,55 +640,67 @@ with trending_tab:
             "SumScore": float(sum_score),
             "Count": int(count),
             "AvgScore": float(round(avg_score, 2)),
-            "Samples": sample_titles[:3]  # small samples for hover
+            "Samples": sample_titles[:3]
         })
 
     df_metrics = pd.DataFrame(metrics).sort_values("SumScore", ascending=False).reset_index(drop=True)
 
     if df_metrics.empty or df_metrics["SumScore"].sum() == 0:
-        st.info("No impactful news detected in the selected timeframe. Try increasing Max Articles or widening the time period.")
-        st.dataframe(df_metrics.head(10), use_container_width=True)
+        st.info("No impactful news detected in selected timeframe.")
+        st.dataframe(df_metrics.head(20), use_container_width=True)
+
     else:
+        # Relative percent
         top_val = df_metrics["SumScore"].max() if df_metrics["SumScore"].max() > 0 else 1
         df_metrics["Percent"] = (df_metrics["SumScore"] / top_val) * 100
         df_metrics["PercentLabel"] = df_metrics["Percent"].round(1).astype(str) + "%"
 
+        # ======================
+        # FIXED CHART STARTS HERE
+        # ======================
         fig = go.Figure()
+
+        # Bars — show percent ABOVE BAR ONLY
         fig.add_trace(go.Bar(
             x=df_metrics["Stock"],
             y=df_metrics["SumScore"],
             name="Summed Impact Score",
-            text=df_metrics["PercentLabel"],
-            textposition='outside',
+            text=df_metrics["PercentLabel"],       # ONLY place where % label appears
+            textposition="outside",
             marker=dict(line=dict(width=0.8, color='rgba(0,0,0,0.12)')),
-            hovertemplate="<b>%{x}</b><br>Sum Score: %{y:.0f}<br>Articles: %{customdata[0]}<extra></extra>",
+            hovertemplate="<b>%{x}</b><br>Sum Score: %{y}<br>Articles: %{customdata[0]}<extra></extra>",
             customdata=df_metrics[["Count"]].values
         ))
+
+        # Line — NO TEXT (fix to remove duplicates)
         fig.add_trace(go.Scatter(
             x=df_metrics["Stock"],
             y=df_metrics["Percent"],
             name="Relative Effect (%)",
             yaxis="y2",
-            mode="lines+markers+text",
-            text=df_metrics["PercentLabel"],
-            textposition="top center",
+            mode="lines+markers",                 # ← text removed
+            marker=dict(size=8),
             hovertemplate="<b>%{x}</b><br>Relative: %{y:.1f}%<extra></extra>",
         ))
+
+        # Layout
         fig.update_layout(
             template=plot_theme,
             title=dict(text=f"Trending F&O Stocks — News Impact ({time_period})", x=0.5),
             xaxis=dict(tickangle=-35),
             yaxis=dict(title="Summed Impact Score", rangemode="tozero"),
-            yaxis2=dict(title="Relative Effect (%)", overlaying="y", side="right", range=[0, max(110, df_metrics["Percent"].max() * 1.15)]),
+            yaxis2=dict(title="Relative Effect (%)", overlaying="y", side="right",
+                        range=[0, max(110, df_metrics["Percent"].max() * 1.15)]),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             margin=dict(t=80, b=140),
             height=520
         )
+
         if dark_mode:
-            fig.update_traces(textfont=dict(color="#FFFFFF"))
+            fig.update_traces(selector=dict(type='bar'), textfont=dict(color="#FFFFFF"))
             fig.update_layout(font=dict(color="#EAEAEA"))
         else:
-            fig.update_traces(textfont=dict(color="#111111"))
+            fig.update_traces(selector=dict(type='bar'), textfont=dict(color="#111111"))
             fig.update_layout(font=dict(color="#111111"))
 
         st.plotly_chart(fig, use_container_width=True)
@@ -719,8 +715,6 @@ with trending_tab:
             "AvgScore": "Avg per Article",
             "Percent": "Relative (%)"
         }), use_container_width=True)
-
-        st.caption("Bars show summed article impact scores (higher = stronger/ more market-impacting signals). The line/markers show the stock's relative effect vs the top stock (top = 100%). Hover bars to see article counts; click legend to toggle series.")
 
 # -----------------------------
 # TAB: SENTIMENT
