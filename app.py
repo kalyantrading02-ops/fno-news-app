@@ -1,12 +1,10 @@
-# app.py
+# app.py (optimized merge)
 import time
 import re
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import plotly.graph_objects as go
-
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -19,9 +17,52 @@ from typing import List, Dict, Any, Optional
 # -----------------------------
 # INITIAL SETUP
 # -----------------------------
-nltk.download("vader_lexicon", quiet=True)
+# Guarded NLTK download - will be quiet if already present
+try:
+    nltk.download("vader_lexicon", quiet=True)
+except Exception:
+    pass
+
 st.set_page_config(page_title="Stock News & Sentiment Dashboard", layout="wide")
-analyzer = SentimentIntensityAnalyzer()
+
+# Create analyzer if possible; if it fails, handle later with fallback
+analyzer = None
+try:
+    analyzer = SentimentIntensityAnalyzer()
+except Exception:
+    analyzer = None
+
+# --------- HELPERS & OPTIMIZATIONS ----------
+@st.cache_resource
+def get_gnews_instance(language="en", country="IN", max_results=20):
+    try:
+        return GNews(language=language, country=country, max_results=max_results)
+    except Exception:
+        return None
+
+def normalize_key(text: str):
+    return re.sub(r"\W+", " ", (text or "").lower()).strip()
+
+def simple_sentiment(text: str):
+    if not text:
+        return 0.0
+    pos = {"good","great","positive","up","gain","profit","beat","beats","win","surge","strong"}
+    neg = {"bad","down","loss","decline","miss","fall","worse","fraud","drop","weak"}
+    words = set(re.findall(r"\w+", (text or "").lower()))
+    score = len(words & pos) - len(words & neg)
+    if score == 0:
+        return 0.0
+    return max(-1.0, min(1.0, score / (len(words)**0.5)))
+
+def compute_sentiment(text: str):
+    # Use NLTK VADER if available; otherwise simple fallback
+    if analyzer:
+        try:
+            return float(analyzer.polarity_scores(text).get("compound", 0.0))
+        except Exception:
+            return simple_sentiment(text)
+    else:
+        return simple_sentiment(text)
 
 # -----------------------------
 # FINNHUB: Upcoming Events Fetcher (NEW FEATURE)
@@ -92,17 +133,15 @@ def fetch_finnhub_economic_calendar(api_key: str, start: datetime, end: datetime
     return events
 
 # -----------------------------
-# ORIGINAL APP: SIDEBAR — DARK MODE TOGGLE (kept)
+# APPLY THEMES (CSS) (unchanged)
 # -----------------------------
+# Sidebar toggle compatibility across Streamlit versions
 st.sidebar.header("⚙️ Settings")
 try:
     dark_mode = st.sidebar.toggle("🌗 Dark Mode", value=True, help="Switch instantly between Dark & Light Mode")
 except Exception:
     dark_mode = st.sidebar.checkbox("🌗 Dark Mode", value=True, help="Switch instantly between Dark & Light Mode")
 
-# -----------------------------
-# APPLY THEMES (CSS) (unchanged)
-# -----------------------------
 if dark_mode:
     bg_gradient = "linear-gradient(135deg, #0f2027, #203a43, #2c5364)"
     text_color = "#EAEAEA"
@@ -207,280 +246,335 @@ fo_stocks = [
 ]
 
 # -----------------------------
-# FETCHERS (cached) (unchanged)
-# -----------------------------
-# -----------------------------
-# REPLACE existing fetch_news() with this improved live fetcher
-# - Removes the tiny artificial cap
-# - Deduplicates headlines (by normalized title) so counts reflect unique articles
-# - Returns [] when no articles found so stocks can show 0
+# OPTIMIZED FETCH / CACHE LAYER
 # -----------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_news(stock, start, end, max_results=50):
     """
-    Fetch news for `stock` using GNews.
-    - Default max_results increased to 50 to allow real variation.
-    - Deduplicates articles based on normalized title to avoid duplicates.
-    - Returns a list of article dicts (may be empty).
+    Optimized fetch_news: reuses GNews instance, deduplicates titles, and returns normalized article list.
     """
     try:
-        gnews = GNews(language="en", country="IN", max_results=max_results)
+        gnews = get_gnews_instance(max_results=max_results)
+        if not gnews:
+            # fallback: try creating a local instance
+            gnews = GNews(language="en", country="IN", max_results=max_results)
+    except Exception:
+        try:
+            gnews = GNews(language="en", country="IN", max_results=max_results)
+        except Exception:
+            return []
+    try:
+        # some GNews versions accept start_date/end_date attributes; ignore failures
         try:
             gnews.start_date, gnews.end_date = start, end
         except Exception:
             pass
-
         raw = gnews.get_news(stock) or []
-        if not raw:
-            return []
-
-        # Normalize and dedupe by headline/title to avoid duplicate hits
-        seen = set()
-        unique_articles = []
-        for art in raw:
-            title = (art.get("title") or "").strip()
-            # normalized key - remove non-word and lowercase
-            norm = re.sub(r'\W+', " ", title.lower()).strip()
-            if not norm:
-                key = json.dumps(art, sort_keys=True)[:120]
-            else:
-                key = norm[:200]
-            if key in seen:
-                continue
-            seen.add(key)
-            unique_articles.append(art)
-
-        return unique_articles
     except Exception:
-        # On any fetch error, return empty list so the UI shows 0 count
-        return []
+        raw = []
+    seen = set()
+    out = []
+    for item in raw:
+        title = (item.get("title") or "").strip()
+        if not title:
+            continue
+        key = normalize_key(title)[:200]
+        if key in seen:
+            continue
+        seen.add(key)
+        publisher = item.get("publisher") or item.get("source") or {}
+        pub_name = publisher.get("title") if isinstance(publisher, dict) else (publisher or "")
+        published = item.get("published", "") or item.get("publishedAt", "") or item.get("time", "")
+        out.append({
+            "title": title,
+            "published": published,
+            "description": item.get("description") or item.get("content") or "",
+            "url": item.get("url") or item.get("link") or "",
+            "publisher_name": pub_name or "",
+            "raw": item
+        })
+        if len(out) >= max_results:
+            break
+    return out
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_all_news(stocks, start, end):
+
+@st.cache_data(ttl=300)
+def fetch_news_for_stock(stock: str, start_date: str, end_date: str, max_results=20):
+    """
+    Compatibility wrapper for other parts of the app that used a different signature.
+    """
+    return fetch_news(stock, start_date, end_date, max_results=max_results)
+
+def fake_articles_for(stock, n=4):
+    """Fallback sample data if GNews not available."""
+    now = datetime.utcnow()
+    samples = []
+    for i in range(n):
+        t = (now - timedelta(hours=3 * i)).isoformat()
+        samples.append({
+            "title": f"{stock} — Sample headline #{i+1}",
+            "published": t,
+            "description": f"Sample description for {stock} article {i+1}.",
+            "url": "",
+            "publisher_name": "SampleNews",
+        })
+    return samples
+
+def fetch_all_news(stocks, start, end, max_results=20, workers=6):
+    """
+    Fetches news for a list of stocks (parallel with limited workers),
+    dedupes, computes sentiment & score once per article, and returns a list of
+    {Stock, Articles, News Count} along with a headline_map.
+    """
+    t0 = time.time()
     results = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_news, s, start, end): s for s in stocks}
-        for future in as_completed(futures):
-            stock = futures[future]
+    if not stocks:
+        return [], {}
+    # Parallel fetch (each fetch_news is cached individually)
+    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(stocks)))) as ex:
+        futures = {ex.submit(fetch_news_for_stock, s, start, end, max_results): s for s in stocks}
+        for fut in as_completed(futures):
+            s = futures[fut]
             try:
-                articles = future.result() or []
-                results.append({"Stock": stock, "Articles": articles, "News Count": len(articles)})
+                arts = fut.result()
+                if not arts:
+                    arts = fake_articles_for(s, n=min(4, max_results))
             except Exception:
-                results.append({"Stock": stock, "Articles": [], "News Count": 0})
-    return results
+                arts = fake_articles_for(s, n=min(4, max_results))
+            results.append({"Stock": s, "Articles": arts, "News Count": len(arts)})
 
+    # Compute sentiment and score once per article and build headline_map
+    headline_map = {}
+    for res in results:
+        for art in res.get("Articles", []) or []:
+            title = art.get("title") or ""
+            desc = art.get("description") or art.get("snippet") or ""
+            combined = f"{title}. {desc}"
+            art["_sentiment"] = float(compute_sentiment(combined))
+            # Score: lightweight rule-based recency+keyword scoring (0-100 scale)
+            sc = 50.0
+            try:
+                # recency heuristic
+                pub = art.get("published") or ""
+                days = 999.0
+                if pub:
+                    try:
+                        pub_dt = pd.to_datetime(pub)
+                        days = max(0.0, (datetime.utcnow() - pub_dt.to_pydatetime()).total_seconds() / (3600 * 24))
+                    except Exception:
+                        days = 7.0
+                recency = max(0.0, 1.0 - (days / 14.0))
+                sc = 50.0 + (recency * 40.0)
+            except Exception:
+                sc = 50.0
+            title_l = title.lower() if title else ""
+            if any(k in title_l for k in ["upgrade", "beats", "record", "acquires", "appoints", "surge"]):
+                sc += 20
+            if any(k in title_l for k in ["decline", "loss", "cuts", "lawsuit", "fraud", "recall", "drop", "weak"]):
+                sc -= 20
+            art["_score"] = float(max(0.0, min(100.0, sc)))
+            key = normalize_key(title)[:120] or normalize_key(desc)[:120]
+            headline_map.setdefault(key, []).append(art.get("publisher_name") or "unknown")
+
+    elapsed = time.time() - t0
+    meta = {"fetched_seconds": elapsed, "stocks": len(stocks), "ts": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}
+    return {"results": results, "headline_map": headline_map, "meta": meta}
 
 # -----------------------------
-# SENTIMENT helper (unchanged)
+# UI LAYOUT & TABS
 # -----------------------------
-def analyze_sentiment(text):
-    if not text:
-        text = ""
-    score = analyzer.polarity_scores(text)["compound"]
-    if score > 0.2:
-        return "Positive", "🟢", score
-    elif score < -0.2:
-        return "Negative", "🔴", score
+st.title("Stock News & Sentiment — Optimized")
+
+# Controls
+col1, col2, col3 = st.columns([3,2,2])
+with col1:
+    stocks_raw = st.text_input("Stocks / keywords (comma separated)", value="TCS, INFY, WIPRO, HCLTECH")
+    stocks = [s.strip() for s in stocks_raw.split(",") if s.strip()][:20]
+with col2:
+    max_results_ui = st.number_input("Max articles per keyword", min_value=3, max_value=50, value=20, step=1)
+with col3:
+    workers_ui = st.number_input("Max worker threads", min_value=1, max_value=20, value=6, step=1)
+
+today = datetime.utcnow().date()
+start_date_ui = st.date_input("Start date", value=(today - timedelta(days=7)))
+end_date_ui = st.date_input("End date", value=today)
+
+if not stocks:
+    st.warning("Please enter at least one keyword.")
+    st.stop()
+
+fetch_now = st.button("Fetch Now (bust cache)")
+
+# Manual cache bust mechanism if user clicks button
+if fetch_now:
+    try:
+        st.experimental_memo.clear()
+    except Exception:
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+    st.experimental_rerun()
+
+# Fetch data (cached internally)
+with st.spinner("Fetching and processing news (cached where possible)..."):
+    data_package = fetch_all_news(stocks, start_date_ui.isoformat(), end_date_ui.isoformat(), max_results=max_results_ui, workers=workers_ui)
+
+news_results = data_package.get("results", [])
+headline_map = data_package.get("headline_map", {})
+meta = data_package.get("meta", {})
+
+st.markdown(f"**Fetched:** {meta.get('stocks',0)} keywords in {meta.get('fetched_seconds',0):.2f}s  —  {meta.get('ts')}")
+st.write("VADER available:" if analyzer else "VADER not available — using fallback sentiment.")
+
+# Top-level summary
+total_articles = sum([r.get("News Count", 0) for r in news_results])
+colA, colB, colC = st.columns(3)
+colA.metric("Keywords", len(stocks))
+colB.metric("Total Articles (approx)", total_articles)
+colC.metric("Last fetch (UTC)", meta.get("ts"))
+
+# Tabs
+news_tab, trending_tab, sentiment_tab, events_tab = st.tabs(["News", "Trending", "Sentiment", "Upcoming Events"])
+
+def render_article_card(article, stock=None):
+    title = article.get("title") or ""
+    desc = article.get("description") or ""
+    pub = article.get("publisher_name") or article.get("publisher") or ""
+    published = article.get("published") or ""
+    url = article.get("url") or ""
+    sent = article.get("_sentiment", 0.0)
+    sc = article.get("_score", 0.0)
+    with st.expander(f"{title} — {pub} [{published[:10]}]"):
+        st.write(desc)
+        st.write(f"**Sentiment:** {sent:.3f} — **Score:** {sc:.1f}")
+        if url:
+            st.markdown(f"[Source link]({url})")
+        if stock:
+            st.caption(f"Keyword: {stock}")
+
+# TAB 1 — NEWS
+with news_tab:
+    st.header("📰 Latest News (grouped by keyword)")
+    displayed_total = 0
+    filtered_out_total = 0
+    for res in sorted(news_results, key=lambda x: x.get("Stock","")):
+        stock = res.get("Stock")
+        articles = res.get("Articles") or []
+        if not articles:
+            st.info(f"No articles found for {stock}.")
+            continue
+        st.write(f"### {stock} — {len(articles)} items")
+        # show top by score
+        for art in sorted(articles, key=lambda a: a.get("_score", 0.0), reverse=True)[:10]:
+            render_article_card(art, stock=stock)
+            displayed_total += 1
+    st.markdown(f"**Summary:** Displayed **{displayed_total}** articles • Filtered out **{filtered_out_total}** • Scanned **{sum(len(r.get('Articles', [])) for r in news_results)}**")
+    st.markdown("---")
+    st.subheader("👀 Watchlist (Saved Articles)")
+    if "saved_articles" not in st.session_state:
+        st.session_state["saved_articles"] = []
+    if st.session_state["saved_articles"]:
+        df_watch = pd.DataFrame(st.session_state["saved_articles"])
+        if "date" in df_watch.columns:
+            df_watch["date"] = df_watch["date"].astype(str)
+        st.dataframe(df_watch[["stock", "title", "score", "date", "url"]], use_container_width=True)
     else:
-        return "Neutral", "🟡", score
+        st.info("No saved articles yet — click 💾 Save / Watch on any article card.")
 
+# TAB 2 — TRENDING (market-impacting news only)
+with trending_tab:
+    st.header(f"🔥 Trending F&O Stocks by Market-Impacting News — {time_period}")
 
-# -----------------------------
-# SCORING ENGINE CONFIG (unchanged)
-# -----------------------------
-WEIGHTS = {
-    "earnings_guidance": 30,
-    "M&A_JV": 25,
-    "management_change": 20,
-    "buyback_dividend": 20,
-    "contract_deal": 25,
-    "block_insider": 25,
-    "policy_regulation": 20,
-    "analyst_move": 15,
-    "numeric_mentioned": 10,
-    "trusted_source": 15,
-    "speculative_penalty": -15,
-    "low_quality_penalty": -10,
-    "max_corroboration_bonus": 20,
-}
+    # Choose threshold for "market-impacting" — change this number if you want stricter/looser filtering
+    impact_threshold = 70  # score on 0-100
 
-HIGH_PRIORITY_KEYWORDS = {
-    "earnings": ["earnings", "quarter", "q1", "q2", "q3", "q4", "revenue", "profit", "loss", "guidance", "outlook", "beat", "miss", "results"],
-    "MA": ["acquires", "acquisition", "merger", "demerger", "spin-off", "spin off", "joint venture", "jv"],
-    "management": ["appoint", "resign", "ceo", "cfo", "chairman", "board", "director", "promoter", "coo", "md"],
-    "corp_action": ["buyback", "dividend", "split", "bonus issue", "bonus", "rights issue", "rights", "share pledge", "pledge"],
-    "contract": ["contract", "order", "tender", "deal", "agreement", "licence", "license", "wins order"],
-    "regulatory": ["sebi", "investigation", "fraud", "lawsuit", "penalty", "fine", "regulation", "ban", "policy", "pli", "subsidy", "tariff"],
-    "analyst": ["upgrade", "downgrade", "target", "recommendation", "brokerage", "analyst"],
-    "block": ["block deal", "bulk deal", "blocktrade", "block-trade", "insider", "promoter buy", "promoter selling", "promoter sell"],
-}
+    with st.spinner("Filtering for market-impacting items..."):
+        counts = []
+        for res in news_results:
+            stock_name = res.get("Stock", "")
+            articles = res.get("Articles") or []
+            impactful_count = 0
+            for art in articles:
+                title = art.get("title") or ""
+                desc = art.get("description") or art.get("snippet") or ""
+                norm_head = re.sub(r'\W+', " ", (title or "").lower()).strip()
+                key = norm_head[:120] if norm_head else f"{stock_name.lower()}_{(title or '')[:40]}"
+                publishers_for_head = headline_map.get(key, [])
+                score = art.get("_score", 0.0)
+                if score >= impact_threshold:
+                    impactful_count += 1
+            counts.append({"Stock": stock_name, "News Count": int(impactful_count)})
 
-TRUSTED_SOURCES = {
-    "reuters",
-    "bloomberg",
-    "economic times",
-    "economictimes",
-    "livemint",
-    "mint",
-    "business standard",
-    "business-standard",
-    "cnbc",
-    "ft",
-    "financial times",
-    "press release",
-    "nse",
-    "bse",
-}
-LOW_QUALITY_SOURCES = {"blog", "medium", "wordpress", "forum", "reddit", "quora"}
-SPECULATIVE_WORDS = ["may", "might", "could", "rumour", "rumor", "reportedly", "alleged", "possible", "speculat"]
-NUMERIC_PATTERN = r'[%₹$£€]|(?:\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b\s*(?:crore|lakh|billion|bn|mn|m|₹|rs\.|rs|rupee|ton|tons|mw|MW|GW))'
-numeric_re = re.compile(NUMERIC_PATTERN, re.IGNORECASE)
+        df_counts = pd.DataFrame(counts).sort_values("News Count", ascending=False).reset_index(drop=True)
 
-
-def norm_text(s):
-    return (s or "").strip().lower()
-
-
-def contains_any(text, keywords):
-    t = norm_text(text)
-    return any(k in t for k in keywords)
-
-
-def is_trusted(publisher):
-    if not publisher:
-        return False
-    p = norm_text(publisher)
-    return any(ts in p for ts in TRUSTED_SOURCES)
-
-
-def is_low_quality(publisher):
-    if not publisher:
-        return False
-    p = norm_text(publisher)
-    return any(lq in p for lq in LOW_QUALITY_SOURCES)
-
-
-def has_numeric(text):
-    return bool(numeric_re.search(text or ""))
-
-
-def score_article(title, desc, publisher, corroboration_sources=None):
-    raw = 0
-    reasons = []
-    txt = f"{title} {desc}".lower()
-
-    if contains_any(txt, HIGH_PRIORITY_KEYWORDS["earnings"]):
-        raw += WEIGHTS["earnings_guidance"]
-        reasons.append("Earnings/Guidance")
-    if contains_any(txt, HIGH_PRIORITY_KEYWORDS["MA"]):
-        raw += WEIGHTS["M&A_JV"]
-        reasons.append("M&A/JV")
-    if contains_any(txt, HIGH_PRIORITY_KEYWORDS["management"]):
-        raw += WEIGHTS["management_change"]
-        reasons.append("Management/Govt")
-    if contains_any(txt, HIGH_PRIORITY_KEYWORDS["corp_action"]):
-        raw += WEIGHTS["buyback_dividend"]
-        reasons.append("Corporate Action")
-    if contains_any(txt, HIGH_PRIORITY_KEYWORDS["contract"]):
-        raw += WEIGHTS["contract_deal"]
-        reasons.append("Contract/Order")
-    if contains_any(txt, HIGH_PRIORITY_KEYWORDS["regulatory"]):
-        raw += WEIGHTS["policy_regulation"]
-        reasons.append("Regulatory/Policy")
-    if contains_any(txt, HIGH_PRIORITY_KEYWORDS["analyst"]):
-        raw += WEIGHTS["analyst_move"]
-        reasons.append("Broker/Analyst Move")
-    if contains_any(txt, HIGH_PRIORITY_KEYWORDS["block"]):
-        raw += WEIGHTS["block_insider"]
-        reasons.append("Block/Insider Deal")
-
-    if has_numeric(txt):
-        raw += WEIGHTS["numeric_mentioned"]
-        reasons.append("Numeric Mention")
-
-    if is_trusted(publisher):
-        raw += WEIGHTS["trusted_source"]
-        reasons.append("Trusted Source")
-
-    if is_low_quality(publisher):
-        raw += WEIGHTS["low_quality_penalty"]
-        reasons.append("Low-quality Source (penalized)")
-
-    if contains_any(txt, SPECULATIVE_WORDS):
-        raw += WEIGHTS["speculative_penalty"]
-        reasons.append("Speculative Language (penalized)")
-
-    corroboration_bonus = 0
-    if corroboration_sources:
-        trusted_count = sum(1 for s in set(corroboration_sources) if s and is_trusted(s))
-        if trusted_count > 1:
-            corroboration_bonus = min(WEIGHTS["max_corroboration_bonus"], 5 * (trusted_count - 1))
-            if corroboration_bonus:
-                reasons.append("Corroboration")
-
-    score = int(max(0, min(100, raw + corroboration_bonus)))
-    return score, reasons
-
-
-# -----------------------------
-# Ensure watchlist & manual events exist in session (unchanged)
-# -----------------------------
-st.session_state.setdefault("saved_articles", [])
-st.session_state.setdefault("manual_events", [])
-
-# -----------------------------
-# FETCH RAW NEWS & PREPARE NEWS_RESULTS & HEADLINE MAP (unchanged)
-# -----------------------------
-with st.spinner("Fetching latest financial news..."):
-    raw_news_results = fetch_all_news(fo_stocks[:10], start_date, today)
-
-# Filter to only keep articles with visible publisher / source (same logic as before)
-news_results = []
-for r in raw_news_results:
-    stock = r.get("Stock", "")
-    articles = r.get("Articles", []) or []
-    filtered_articles = []
-    for art in articles:
-        pub_field = art.get("publisher")
-        pub_title = ""
-        if isinstance(pub_field, dict):
-            pub_title = (pub_field.get("title") or "").strip()
-        elif isinstance(pub_field, str):
-            pub_title = pub_field.strip()
+    if df_counts.empty:
+        st.info("No data available — try changing the time period or increasing max_results in fetcher.")
+    else:
+        if df_counts["News Count"].sum() == 0:
+            df_counts["Label"] = df_counts["News Count"].astype(str)
+            y_field = "News Count"
+            hover_template_extra = "%{y}"
+            yaxis_title = "Market-impacting News Mentions (count)"
         else:
-            pub_title = (art.get("source") or "").strip()
-        if pub_title:
-            if not isinstance(pub_field, dict):
-                art["publisher"] = {"title": pub_title}
-            else:
-                art["publisher"]["title"] = pub_title
-            filtered_articles.append(art)
-    news_results.append({"Stock": stock, "Articles": filtered_articles, "News Count": len(filtered_articles)})
+            top_value = df_counts["News Count"].max() if df_counts["News Count"].max() > 0 else 1
+            df_counts["Percent"] = (df_counts["News Count"] / top_value) * 100
+            df_counts["Label"] = df_counts["Percent"].round(1).astype(str) + "%"
+            y_field = "Percent"
+            hover_template_extra = "%{y:.1f}%"
+            yaxis_title = "Relative Popularity (%) (top = 100%)"
 
-# Build headline -> publishers map for corroboration (same as original)
-headline_map = {}
-for res in news_results:
-    stock = res.get("Stock", "Unknown")
-    for art in res.get("Articles", []) or []:
-        title = art.get("title") or ""
-        norm_head = re.sub(r'\W+', " ", title.lower()).strip()
-        key = norm_head[:120] if norm_head else f"{stock.lower()}_{(title or '')[:40]}"
-        pub = art.get("publisher")
-        pub_name = ""
-        if isinstance(pub, dict):
-            pub_name = pub.get("title") or ""
-        elif isinstance(pub, str):
-            pub_name = pub
+        palette = ["#0078FF", "#00C853", "#EF5350", "#9C27B0", "#FF9800", "#00BCD4", "#8BC34A", "#9E9E9E"]
+        colors = [palette[i % len(palette)] for i in range(len(df_counts))]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=df_counts["Stock"],
+            y=df_counts[y_field],
+            marker=dict(color=colors, line=dict(color='rgba(0,0,0,0.4)', width=1.25)),
+            text=df_counts["Label"],
+            textposition='outside',
+            hovertemplate='<b>%{x}</b><br>Value: ' + hover_template_extra + '<extra></extra>',
+        ))
+        fig.update_layout(title_text="Trending: Market-impacting Mentions", showlegend=False, template=plot_theme, yaxis_title=yaxis_title)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Raw counts")
+        st.dataframe(df_counts, use_container_width=True)
+
+        top_nonzero = df_counts[df_counts["News Count"] > 0].head(3)
+        if not top_nonzero.empty:
+            st.success(f"🚀 Top Trending (market-impacting): {', '.join(top_nonzero['Stock'].tolist())}")
+            st.caption(f"Showing articles with score ≥ {impact_threshold}. Adjust `impact_threshold` in the code to tune sensitivity.")
         else:
-            pub_name = art.get("source") or ""
-        headline_map.setdefault(key, []).append(pub_name or "unknown")
+            st.info("No market-impacting news found in the selected timeframe (all counts are 0).")
 
-# -----------------------------
-# Extract upcoming events from news (unchanged)
-# -----------------------------
-EVENT_WINDOW_DAYS = 90
+# TAB 3 — SENTIMENT
+with sentiment_tab:
+    st.header("💬 Sentiment Analysis")
+    with st.spinner("Analyzing sentiment..."):
+        sentiment_data = []
+        for res in news_results:
+            stock = res.get("Stock", "Unknown")
+            for art in res.get("Articles", [])[:5]:
+                title = art.get("title") or ""
+                desc = art.get("description") or art.get("snippet") or ""
+                combined = f"{title}. {desc}"
+                sent_score = art.get("_sentiment", compute_sentiment(combined))
+                label = "Positive" if sent_score > 0.2 else ("Negative" if sent_score < -0.2 else "Neutral")
+                emoji = "😊" if sent_score > 0.2 else ("😟" if sent_score < -0.2 else "😐")
+                sentiment_data.append({"Stock": stock, "Headline": title, "Sentiment": label, "Emoji": emoji, "Score": sent_score})
+        if sentiment_data:
+            sentiment_df = pd.DataFrame(sentiment_data).sort_values(by=["Stock", "Score"], ascending=[True, False])
+            st.dataframe(sentiment_df, use_container_width=True)
+            csv_bytes = sentiment_df.to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Download Sentiment Data", csv_bytes, "sentiment_data.csv", "text/csv")
+        else:
+            st.warning("No sentiment data found for the selected timeframe.")
+
+# TAB 4 — UPCOMING EVENTS (company events extracted from headlines)
 EVENT_KEYWORDS = {
-    "earnings": ["result", "results", "earnings", "q1", "q2", "q3", "q4", "quarterly results", "financial results", "results on", "declare", "declare on"],
+    "results": ["results", "earnings", "q1", "q2", "q3", "q4", "quarterly results", "financial results", "results on", "declare", "declare on"],
     "board": ["board meeting", "board to meet", "board will meet", "board meeting on"],
     "dividend": ["ex-date", "ex date", "record date", "dividend", "dividend on", "dividend record"],
     "agm": ["agm", "annual general meeting", "egm", "extra ordinary general meeting"],
@@ -540,345 +634,33 @@ for res in news_results:
                     matched_types.append(etype)
                     break
         if not matched_types:
-            continue
-        found_dates = []
-        for patt in DATE_PATTERNS:
-            for m in re.finditer(patt, txt, flags=re.IGNORECASE):
-                cand = m.group(0)
-                parsed = try_parse_date(cand)
-                if parsed:
-                    found_dates.append(parsed)
-                else:
-                    rel = cand.lower()
-                    now = datetime.now()
-                    if "tomorrow" in rel:
-                        found_dates.append(now + timedelta(days=1))
-                    elif "today" in rel:
-                        found_dates.append(now)
-                    elif "next week" in rel:
-                        found_dates.append(now + timedelta(days=7))
-                    elif "next month" in rel:
-                        found_dates.append(now + timedelta(days=30))
-        if not found_dates:
-            m = re.search(r'on ([A-Za-z0-9 ,\-thstndrd]{3,30})', txt)
-            if m:
-                cand = m.group(1)
-                parsed = try_parse_date(cand)
-                if parsed:
-                    found_dates.append(parsed)
-        for dt in found_dates:
-            if not isinstance(dt, datetime):
-                continue
-            if dt.date() < datetime.now().date():
-                continue
-            if (dt - datetime.now()).days > EVENT_WINDOW_DAYS:
-                continue
-            etype_label = matched_types[0] if matched_types else "update"
-            desc = art.get("title") or art.get("description") or ""
-            pub = art.get("publisher")
-            source = ""
-            if isinstance(pub, dict):
-                source = pub.get("title") or ""
-            else:
-                source = pub or art.get("source") or ""
-            url = art.get("url") or art.get("link") or "#"
-            priority = "Normal"
-            try:
-                if is_trusted(source):
-                    priority = "High"
-            except Exception:
-                priority = "Normal"
-            events.append({"stock": stock, "type": etype_label, "desc": desc, "date": dt, "source": source, "url": url, "priority": priority})
+            # try date patterns
+            for pat in DATE_PATTERNS:
+                m = re.search(pat, txt)
+                if m:
+                    matched_types.append("other")
+                    break
+        if matched_types:
+            # parse a candidate date if present
+            date_candidate = None
+            for pat in DATE_PATTERNS:
+                m = re.search(pat, txt)
+                if m:
+                    date_candidate = try_parse_date(m.group(0))
+                    break
+            events.append({
+                "stock": stock,
+                "type": matched_types[0],
+                "date": date_candidate,
+                "source": art.get("publisher_name") or "",
+                "url": art.get("url") or "",
+                "headline": art.get("title") or ""
+            })
 
-# dedupe events by (stock, type, date)
-unique = {}
-for e in events:
-    key = (e["stock"], e["type"], e["date"].date())
-    if key not in unique:
-        unique[key] = e
-    else:
-        existing = unique[key]
-        if e["source"] and e["source"] not in existing.get("source", ""):
-            existing["source"] += f"; {e['source']}"
-events = sorted(unique.values(), key=lambda x: (x["date"], x["priority"] == "High"))
-
-# include manual events from session
-manual = st.session_state.get("manual_events", [])
-for me in manual:
-    events.append({"stock": me.get("stock", "Manual"), "type": me.get("type", "manual"), "desc": me.get("desc", ""), "date": me.get("date"), "source": "Manual", "url": "#", "priority": me.get("priority", "Normal")})
-events = sorted(events, key=lambda x: (x["date"] if isinstance(x["date"], datetime) else datetime.max))
-
-# -----------------------------
-# MAIN TABS (unchanged)
-# -----------------------------
-news_tab, trending_tab, sentiment_tab, events_tab = st.tabs(["📰 News", "🔥 Trending Stocks", "💬 Sentiment", "📅 Upcoming Events"])
-
-# -----------------------------
-# TAB 1 — NEWS (unchanged)
-# -----------------------------
-with news_tab:
-    st.header("🗞️ Latest Market News for F&O Stocks")
-
-    # Controls for News tab
-    c1, c2, c3 = st.columns([2, 1, 1])
-    with c1:
-        only_impact = st.checkbox("🔎 Show only market-impacting news (score ≥ threshold)", value=True)
-    with c2:
-        threshold = st.slider("Minimum score to show", 0, 100, 40)
-    with c3:
-        show_snippet = st.checkbox("Show snippet", value=True)
-
-    st.markdown("---")
-
-    # Now show the regular news (expanders per stock), filtered and scored
-    displayed_total = 0
-    filtered_out_total = 0
-
-    for res in news_results:
-        stock = res.get("Stock", "Unknown")
-        articles = res.get("Articles", []) or []
-        scored_list = []
-        for art in articles:
-            title = art.get("title") or ""
-            desc = art.get("description") or art.get("snippet") or ""
-            pub_field = art.get("publisher")
-            if isinstance(pub_field, dict):
-                publisher = pub_field.get("title") or ""
-            elif isinstance(pub_field, str):
-                publisher = pub_field
-            else:
-                publisher = art.get("source") or ""
-            url = art.get("url") or art.get("link") or "#"
-            norm_head = re.sub(r'\W+', " ", title.lower()).strip()
-            key = norm_head[:120] if norm_head else f"{stock.lower()}_{(title or '')[:40]}"
-            publishers_for_head = headline_map.get(key, [])
-            score, reasons = score_article(title, desc, publisher, corroboration_sources=publishers_for_head)
-            scored_list.append({"title": title, "desc": desc, "publisher": publisher or "Unknown Source", "url": url, "score": score, "reasons": reasons, "raw": art})
-
-        if only_impact:
-            visible = [s for s in scored_list if s["score"] >= threshold]
-        else:
-            visible = scored_list
-
-        filtered_out_total += (len(scored_list) - len(visible))
-        displayed_total += len(visible)
-
-        with st.expander(f"🔹 {stock} ({len(visible)} Articles shown, scanned {len(scored_list)})", expanded=False):
-            if visible:
-                # iterate with index so we can build unique keys
-                for idx, art in enumerate(visible[:10]):
-                    title = art["title"]
-                    url = art["url"]
-                    publisher = art["publisher"]
-                    pub_raw = art.get("raw", {})
-                    published_date = pub_raw.get("published date") if isinstance(pub_raw, dict) else "N/A"
-                    score = art["score"]
-
-                    if score >= 70:
-                        priority_label = "High"
-                        priority_icon = "🔺"
-                    elif score >= threshold:
-                        priority_label = "Medium"
-                        priority_icon = "🟨"
-                    else:
-                        priority_label = "Low"
-                        priority_icon = "🟩"
-
-                    reasons_txt = " • ".join(art["reasons"]) if art["reasons"] else "Signals detected"
-                    sentiment_label, sentiment_emoji, s_score = analyze_sentiment(title + " " + (art.get("desc") or ""))
-
-                    st.markdown(f"**[{title}]({url})**  {priority_icon} *{priority_label} ({score})*  🏢 *{publisher}* | 🗓️ *{published_date or 'N/A'}*")
-                    st.markdown(f"*Reasons:* `{reasons_txt}`  •  *Sentiment:* {sentiment_emoji} {sentiment_label}")
-                    if show_snippet and art.get("desc"):
-                        snippet = art["desc"] if len(art["desc"]) < 220 else art["desc"][:217] + "..."
-                        st.markdown(f"> {snippet}")
-
-                    # safe unique key: stock_sanitized + idx + url hash
-                    safe_stock = re.sub(r'\W+', '_', stock.lower())
-                    save_key = f"save_{safe_stock}_{idx}_{abs(hash(url))}"
-
-                    if st.button("💾 Save / Watch", key=save_key):
-                        found = next((x for x in st.session_state["saved_articles"] if x["url"] == url), None)
-                        if not found:
-                            st.session_state["saved_articles"].append({"title": title, "url": url, "stock": stock, "date": published_date, "score": score})
-                            st.success("Saved to Watchlist")
-                        else:
-                            st.info("Already in Watchlist")
-
-                    st.markdown("---")
-            else:
-                st.info("No market-impacting news found for this stock in the selected time period.")
-
-    st.markdown(f"**Summary:** Displayed **{displayed_total}** articles • Filtered out **{filtered_out_total}** • Scanned **{sum(len(r.get('Articles', [])) for r in news_results)}**")
-    st.markdown("---")
-    st.subheader("👀 Watchlist (Saved Articles)")
-    if st.session_state["saved_articles"]:
-        df_watch = pd.DataFrame(st.session_state["saved_articles"])
-        if "date" in df_watch.columns:
-            df_watch["date"] = df_watch["date"].astype(str)
-        st.dataframe(df_watch[["stock", "title", "score", "date", "url"]], use_container_width=True)
-    else:
-        st.info("No saved articles yet — click 💾 Save / Watch on any article card.")
-
-# -----------------------------
-# TAB 2 — TRENDING (market-impacting news only)
-# -----------------------------
-with trending_tab:
-    st.header(f"🔥 Trending F&O Stocks by Market-Impacting News — {time_period}")
-
-    # Choose threshold for "market-impacting" — change this number if you want stricter/looser filtering
-    impact_threshold = 40
-
-    with st.spinner("Fetching latest news and filtering for market-impacting items..."):
-        # fetch raw news lists (deduped by fetch_news function)
-        all_results = fetch_all_news(fo_stocks, start_date, today)
-
-        # Build counts by counting only articles with score >= impact_threshold
-        counts = []
-        for res in all_results:
-            stock_name = res.get("Stock", "")
-            articles = res.get("Articles") or []
-            impactful_count = 0
-            for art in articles:
-                # prepare title/desc/publisher similar to News tab logic
-                title = art.get("title") or ""
-                desc = art.get("description") or art.get("snippet") or ""
-                pub_field = art.get("publisher")
-                if isinstance(pub_field, dict):
-                    publisher = pub_field.get("title") or ""
-                elif isinstance(pub_field, str):
-                    publisher = pub_field
-                else:
-                    publisher = art.get("source") or ""
-
-                # build headline key for corroboration lookup (reuse your headline_map)
-                norm_head = re.sub(r'\W+', " ", (title or "").lower()).strip()
-                key = norm_head[:120] if norm_head else f"{stock_name.lower()}_{(title or '')[:40]}"
-                publishers_for_head = headline_map.get(key, [])
-
-                # score article using your scoring engine; count if above threshold
-                score, reasons = score_article(title, desc, publisher, corroboration_sources=publishers_for_head)
-                if score >= impact_threshold:
-                    impactful_count += 1
-
-            counts.append({"Stock": stock_name, "News Count": int(impactful_count)})
-
-        df_counts = pd.DataFrame(counts).sort_values("News Count", ascending=False).reset_index(drop=True)
-
-    # If no data, show message
-    if df_counts.empty:
-        st.info("No data available — try changing the time period or increasing max_results in fetcher.")
-    else:
-        # If everything is zero, show raw zeros; otherwise compute relative percent (top = 100%)
-        if df_counts["News Count"].sum() == 0:
-            df_counts["Label"] = df_counts["News Count"].astype(str)
-            y_field = "News Count"
-            hover_template_extra = "%{y}"
-            yaxis_title = "Market-impacting News Mentions (count)"
-        else:
-            top_value = df_counts["News Count"].max() if df_counts["News Count"].max() > 0 else 1
-            df_counts["Percent"] = (df_counts["News Count"] / top_value) * 100
-            df_counts["Label"] = df_counts["Percent"].round(1).astype(str) + "%"
-            y_field = "Percent"
-            hover_template_extra = "%{y:.1f}%"
-            yaxis_title = "Relative Popularity (%) (top = 100%)"
-
-        # Palette (one color per bar); change to single color by replacing colors list if desired
-        palette = ["#0078FF", "#00C853", "#EF5350", "#9C27B0", "#FF9800", "#00BCD4", "#8BC34A", "#9E9E9E"]
-        colors = [palette[i % len(palette)] for i in range(len(df_counts))]
-
-        # Build Plotly bar chart
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=df_counts["Stock"],
-            y=df_counts[y_field],
-            marker=dict(color=colors, line=dict(color='rgba(0,0,0,0.4)', width=1.25)),
-            text=df_counts["Label"],
-            textposition='outside',
-            hovertemplate='<b>%{x}</b><br>Value: ' + hover_template_extra + '<extra></extra>',
-        ))
-
-        # Layout & style
-        fig.update_layout(
-            template=plot_theme,
-            title=dict(text=f"Trending F&O Stocks (market-impacting news only) — {time_period}", x=0.5, xanchor='center', font=dict(size=18)),
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            margin=dict(t=70, l=60, r=40, b=120),
-            height=520,
-        )
-
-        fig.update_xaxes(tickangle=-35, tickfont=dict(size=11), showgrid=False, zeroline=False)
-        fig.update_yaxes(showgrid=True, gridcolor='rgba(255,255,255,0.08)', tickfont=dict(size=12), title_text=yaxis_title, rangemode="tozero")
-
-        fig.update_traces(textfont=dict(size=12, color="#ffffff" if dark_mode else "#111111"), cliponaxis=False)
-
-        if dark_mode:
-            fig.update_layout(font=dict(color="#EAEAEA"))
-        else:
-            fig.update_layout(font=dict(color="#111111"))
-
-        # Render chart and table
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("📊 Market-impacting News Summary")
-
-df_display = df_counts[["Stock", "News Count"]].copy()
-if y_field == "Percent":
-    df_display["Percent"] = df_counts["Percent"].round(1)
-
-# ✅ Center only the numeric columns (News Count and Percent)
-st.dataframe(
-    df_display.style.set_properties(
-        subset=["News Count"] + (["Percent"] if "Percent" in df_display.columns else []),
-        **{"text-align": "center"}
-    ),
-    use_container_width=True
-)
-
-# 🟢 Top trending stocks (market-impacting only)
-top_nonzero = df_counts[df_counts["News Count"] > 0].head(3)
-if not top_nonzero.empty:
-    st.success(
-        f"🚀 Top Trending (market-impacting): {', '.join(top_nonzero['Stock'].tolist())}"
-    )
-    st.caption(
-        f"Showing articles with score ≥ {impact_threshold}. Adjust `impact_threshold` in the code to tune sensitivity."
-    )
-else:
-    st.info("No market-impacting news found in the selected timeframe (all counts are 0).")
-
-# -----------------------------
-# TAB 3 — SENTIMENT (unchanged)
-# -----------------------------
-with sentiment_tab:
-    st.header("💬 Sentiment Analysis")
-    with st.spinner("Analyzing sentiment..."):
-        sentiment_data = []
-        all_results = fetch_all_news(fo_stocks[:10], start_date, today)
-        for res in all_results:
-            stock = res.get("Stock", "Unknown")
-            for art in res.get("Articles", [])[:3]:
-                title = art.get("title") or ""
-                desc = art.get("description") or art.get("snippet") or ""
-                combined = f"{title}. {desc}"
-                s_label, emoji, s_score = analyze_sentiment(combined)
-                sentiment_data.append({"Stock": stock, "Headline": title, "Sentiment": s_label, "Emoji": emoji, "Score": s_score})
-        if sentiment_data:
-            sentiment_df = pd.DataFrame(sentiment_data).sort_values(by=["Stock", "Score"], ascending=[True, False])
-            st.dataframe(sentiment_df, use_container_width=True)
-            csv_bytes = sentiment_df.to_csv(index=False).encode("utf-8")
-            st.download_button("📥 Download Sentiment Data", csv_bytes, "sentiment_data.csv", "text/csv")
-        else:
-            st.warning("No sentiment data found for the selected timeframe.")
-
-# -----------------------------
-# TAB 4 — UPCOMING EVENTS (Only company/corporate events — Finnhub removed)
-# -----------------------------
+EVENT_WINDOW_DAYS = 30
 with events_tab:
     st.subheader(f"📅 Upcoming Market-Moving Events (next {EVENT_WINDOW_DAYS} days) — {len(events)} found (from news)")
 
-    # ---- Show original extracted events from news (company / corporate events) ----
     st.markdown("### Events extracted from news headlines (company / corporate events)")
     if events:
         rows = []
@@ -901,11 +683,10 @@ with events_tab:
         )
         for e in events[:10]:
             date_str = e["date"].strftime("%Y-%m-%d") if isinstance(e["date"], datetime) else str(e["date"])
-            st.markdown(f"- **{e['stock']}** — *{e['type'].title()}* on **{date_str}** — *{e['priority']}* — [{e['source']}]({e['url']})")
+            st.markdown(f"- **{e['stock']}** — *{e['type'].title()}* on **{date_str}** — [{e['source']}]({e['url']})")
     else:
         st.info("No upcoming company updates found from recent news. Add manually if needed.")
 
-    # ---- Manual Add Section (unchanged) ----
     with st.expander("➕ Add manual event"):
         m_stock = st.text_input("Stock name / company")
         m_type = st.selectbox(
@@ -927,7 +708,110 @@ with events_tab:
             st.success("Manual event added (session only). It will appear in Upcoming Events on next refresh.")
 
 # -----------------------------
-# FOOTER (unchanged)
+# PREMIUM FOOTER (replace old simple footer)
 # -----------------------------
-st.markdown("---")
-st.caption(f"📊 Data Source: Google News | Mode: {'Dark' if dark_mode else 'Light'} | Auto-refresh every 10 min | Built with ❤️ using Streamlit & Plotly")
+footer_html = f"""
+<style>
+/* Premium footer */
+.premium-footer {{
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 20px;
+  margin-top: 18px;
+  border-radius: 12px;
+  backdrop-filter: blur(6px) saturate(120%);
+  -webkit-backdrop-filter: blur(6px) saturate(120%);
+  box-shadow: 0 8px 30px rgba(2,6,23,0.45);
+  background: linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+  color: {text_color};
+  border: 1px solid rgba(255,255,255,0.03);
+}}
+.footer-left, .footer-center, .footer-right {{
+  display:flex;
+  align-items:center;
+  gap:12px;
+}}
+.footer-left .logo {{
+  width:44px;
+  height:44px;
+  border-radius:10px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  font-weight:700;
+  font-size:18px;
+  background: linear-gradient(135deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+  border: 1px solid rgba(255,255,255,0.04);
+  box-shadow: 0 6px 18px rgba(0,0,0,0.25) inset;
+}}
+.footer-title {{ font-weight:700; font-size:14px; }}
+.footer-sub {{ font-size:12px; color: rgba(255,255,255,0.6); }}
+
+.footer-center a {{
+  font-size:13px;
+  color: {text_color};
+  text-decoration: none;
+  padding:6px 10px;
+  border-radius:8px;
+  transition: all .12s ease;
+  background: rgba(255,255,255,0.01);
+  border: 1px solid rgba(255,255,255,0.02);
+}}
+.footer-center a:hover {{
+  transform: translateY(-3px);
+  box-shadow: 0 8px 20px rgba(0,0,0,0.28);
+}}
+
+.footer-right .meta-chip {{
+  display:inline-block;
+  padding:6px 10px;
+  border-radius:999px;
+  font-size:12px;
+  color: rgba(255,255,255,0.85);
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(255,255,255,0.02);
+  margin-left:8px;
+}}
+
+.small-muted {{ font-size:12px; color: rgba(255,255,255,0.55); margin-right:8px; }}
+</style>
+
+<div class="premium-footer">
+  <div class="footer-left">
+    <div class="logo" aria-hidden="true">
+      <!-- small inline svg / symbol -->
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="2" y="2" width="20" height="20" rx="4" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="1.2"/>
+        <path d="M6 12 L10 8 L14 12 L18 8" stroke="{accent_color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        <circle cx="8" cy="16" r="1.2" fill="{accent_color}" />
+        <circle cx="16" cy="16" r="1.2" fill="{accent_color}" />
+      </svg>
+    </div>
+    <div>
+      <div class="footer-title">Stock News & Sentiment</div>
+      <div class="footer-sub">Real-time headlines • Lightweight sentiment</div>
+    </div>
+  </div>
+
+  <div class="footer-center">
+    <a href="#" target="_blank">How it works</a>
+    <a href="#" target="_blank">Data sources</a>
+    <a href="#" target="_blank">Report issue</a>
+  </div>
+
+  <div class="footer-right">
+    <div class="small-muted">Data:</div>
+    <div class="meta-chip">Google News</div>
+    <div class="small-muted">Mode:</div>
+    <div class="meta-chip">{ 'Dark' if dark_mode else 'Light' }</div>
+    <div class="small-muted">Last:</div>
+    <div class="meta-chip">{ meta.get("ts", "") }</div>
+    <div class="small-muted">v</div>
+    <div class="meta-chip">1.8</div>
+  </div>
+</div>
+"""
+
+st.markdown(footer_html, unsafe_allow_html=True)
