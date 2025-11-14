@@ -14,6 +14,35 @@ from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import requests  # NEW: used for Finnhub calendar fetch
 from typing import List, Dict, Any, Optional
 
+# Lazy VADER init (copy & replace current eager download/init)
+_vader = None
+def get_vader():
+    global _vader
+    if _vader is None:
+        try:
+            import nltk
+            nltk.download("vader_lexicon", quiet=True)
+        except Exception:
+            pass
+        try:
+            from nltk.sentiment.vader import SentimentIntensityAnalyzer
+            _vader = SentimentIntensityAnalyzer()
+        except Exception:
+            _vader = None
+    return _vader
+
+def analyze_sentiment(text):
+    analyzer = get_vader()
+    if not analyzer:
+        return "Neutral", "🟡", 0.0
+    score = analyzer.polarity_scores(text)["compound"]
+    if score > 0.2:
+        return "Positive", "🟢", score
+    elif score < -0.2:
+        return "Negative", "🔴", score
+    else:
+        return "Neutral", "🟡", score
+
 # -----------------------------
 # INITIAL SETUP
 # -----------------------------
