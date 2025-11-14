@@ -413,16 +413,18 @@ with news_tab:
 # TAB: TRENDING (fixed & robust)
 # -----------------------------
 with trending_tab:
-    st.header(f"🔥 Trending F&O Stocks by Market-Impacting News — {time_period}")
+    st.header(f"🔥 Trending F&O Stocks — Impact from recent news ({time_period})")
 
-    impact_threshold = st.slider("Impact threshold (score)", 0, 100, 40)
-    st.caption("Lower the threshold to capture more items. Increase Max Articles per stock in sidebar to fetch more.")
+    st.markdown(
+        "This chart shows the **real effect** of news on each F&O stock for the selected time window. "
+        "Bars = summed impact score (higher = more/stronger signals). Line & markers = relative effect vs top stock (top = 100%)."
+    )
 
-    # Fetch full list (this is heavier; done on-demand in Trending)
-    with st.spinner("Fetching news for trending calculation..."):
+    # Fetch full news for all F&O stocks (on-demand)
+    with st.spinner("Calculating news impact across F&O stocks..."):
         all_results = fetch_all_news(fo_stocks, start_date, today, max_results=40)
 
-    # Rebuild headline_map from all_results for consistency
+    # Rebuild corroboration map from the same dataset
     headline_map_full = {}
     for res in all_results:
         stock = res.get("Stock", "")
@@ -440,13 +442,14 @@ with trending_tab:
                 pub_name = art.get("source") or ""
             headline_map_full.setdefault(key, []).append(pub_name or "unknown")
 
-    counts = []
-    debug_samples = []
+    # Aggregate metrics per stock (sum of article scores, article count, avg score)
+    metrics = []
     for res in all_results:
-        stock_name = res.get("Stock", "")
+        stock = res.get("Stock", "")
         articles = res.get("Articles") or []
-        impactful_count = 0
-
+        sum_score = 0
+        count = 0
+        sample_titles = []
         for art in articles:
             title = art.get("title") or ""
             desc = art.get("description") or art.get("snippet") or ""
@@ -457,44 +460,99 @@ with trending_tab:
                 publisher = pub_field
             else:
                 publisher = art.get("source") or ""
-
             norm_head = re.sub(r'\W+', " ", (title or "").lower()).strip()
-            key = norm_head[:120] if norm_head else f"{stock_name.lower()}_{(title or '')[:40]}"
-            publishers_for_head = headline_map_full.get(key, [])
+            key = norm_head[:120] if norm_head else f"{stock.lower()}_{(title or '')[:40]}"
+            pubs = headline_map_full.get(key, [])
+            score, reasons = score_article(title, desc, publisher, corroboration_sources=pubs)
+            # accumulate
+            sum_score += score
+            if title:
+                sample_titles.append({"title": title, "score": score, "publisher": publisher})
+            count += 1
 
-            score, reasons = score_article(title, desc, publisher, corroboration_sources=publishers_for_head)
-            if score >= impact_threshold:
-                impactful_count += 1
+        avg_score = (sum_score / count) if count else 0
+        metrics.append({
+            "Stock": stock,
+            "SumScore": float(sum_score),
+            "Count": int(count),
+            "AvgScore": float(round(avg_score, 2)),
+            "Samples": sample_titles[:3]  # small samples for hover
+        })
 
-            if len(debug_samples) < 6 and title:
-                debug_samples.append({"stock": stock_name, "title": title, "score": score, "publisher": publisher})
+    df_metrics = pd.DataFrame(metrics).sort_values("SumScore", ascending=False).reset_index(drop=True)
 
-        counts.append({"Stock": stock_name, "News Count": int(impactful_count)})
-
-    df_counts = pd.DataFrame(counts).sort_values("News Count", ascending=False).reset_index(drop=True)
-
-    if df_counts.empty:
-        st.info("No data available — try increasing Max Articles or widening time period.")
+    if df_metrics.empty or df_metrics["SumScore"].sum() == 0:
+        st.info("No impactful news detected in the selected timeframe. Try increasing Max Articles or widening the time period.")
+        # show small debug table
+        st.dataframe(df_metrics.head(10), use_container_width=True)
     else:
-        # Simple bar chart
+        # Relative percent vs top
+        top_val = df_metrics["SumScore"].max() if df_metrics["SumScore"].max() > 0 else 1
+        df_metrics["Percent"] = (df_metrics["SumScore"] / top_val) * 100
+        df_metrics["PercentLabel"] = df_metrics["Percent"].round(1).astype(str) + "%"
+
+        # Build combined bar + line chart
         fig = go.Figure()
+
+        # Bar = absolute summed score
         fig.add_trace(go.Bar(
-            x=df_counts["Stock"],
-            y=df_counts["News Count"],
-            text=df_counts["News Count"],
-            textposition='outside'
+            x=df_metrics["Stock"],
+            y=df_metrics["SumScore"],
+            name="Summed Impact Score",
+            text=df_metrics["PercentLabel"],          # show percent above each bar
+            textposition="outside",
+            marker=dict(line=dict(width=0.8, color='rgba(0,0,0,0.12)')),
+            hovertemplate="<b>%{x}</b><br>Sum Score: %{y:.0f}<br>Articles: %{customdata[0]}<extra></extra>",
+            customdata=df_metrics[["Count"]].values
         ))
-        fig.update_layout(template=plot_theme, title_text=f"Trending F&O Stocks (market-impacting news only) — {time_period}", xaxis_tickangle=-35, height=520)
+
+        # Line/markers = percent (secondary y-axis)
+        fig.add_trace(go.Scatter(
+            x=df_metrics["Stock"],
+            y=df_metrics["Percent"],
+            name="Relative Effect (%)",
+            yaxis="y2",
+            mode="lines+markers+text",
+            text=df_metrics["PercentLabel"],
+            textposition="top center",
+            hovertemplate="<b>%{x}</b><br>Relative: %{y:.1f}%<extra></extra>",
+        ))
+
+        # Layout with secondary y-axis
+        fig.update_layout(
+            template=plot_theme,
+            title=dict(text=f"Trending F&O Stocks — News Impact ({time_period})", x=0.5),
+            xaxis=dict(tickangle=-35),
+            yaxis=dict(title="Summed Impact Score", rangemode="tozero"),
+            yaxis2=dict(title="Relative Effect (%)", overlaying="y", side="right", range=[0, max(110, df_metrics["Percent"].max() * 1.15)]),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(t=80, b=140),
+            height=520
+        )
+
+        # Style: ensure text colors visible in dark mode
+        if dark_mode:
+            fig.update_traces(textfont=dict(color="#FFFFFF"))
+            fig.update_layout(font=dict(color="#EAEAEA"))
+        else:
+            fig.update_traces(textfont=dict(color="#111111"))
+            fig.update_layout(font=dict(color="#111111"))
+
         st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("📊 Market-impacting News Summary")
-        st.dataframe(df_counts, use_container_width=True)
+        # Summary table below
+        st.subheader("📊 Market-impacting News Summary (top 20)")
+        df_display = df_metrics[["Stock", "SumScore", "Count", "AvgScore", "Percent"]].copy()
+        df_display["SumScore"] = df_display["SumScore"].round(1)
+        df_display["Percent"] = df_display["Percent"].round(1)
+        st.dataframe(df_display.head(20).rename(columns={
+            "SumScore": "Impact Score",
+            "Count": "Articles Scanned",
+            "AvgScore": "Avg per Article",
+            "Percent": "Relative (%)"
+        }), use_container_width=True)
 
-        if df_counts["News Count"].sum() == 0:
-            st.warning("All counts are zero. Possible causes: low max_results, strict impact threshold, or no articles returned by the fetcher.")
-            st.markdown("**Debug sample headlines (score):**")
-            for d in debug_samples:
-                st.markdown(f"- **{d['stock']}** — {d['title'][:120]} — *score {d['score']}* — _{d['publisher']}_")
+        st.caption("Bars show summed article impact scores (higher = stronger/ more market-impacting signals). The line/markers show the stock's relative effect vs the top stock (top = 100%). Hover bars to see article counts; click legend to toggle series.")
 
 # -----------------------------
 # TAB: SENTIMENT
