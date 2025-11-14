@@ -1,3 +1,4 @@
+import os
 import time
 import re
 import json
@@ -15,6 +16,12 @@ from gnews import GNews
 # STREAMLIT SETTINGS
 # -----------------------------
 st.set_page_config(page_title="Stock News & Sentiment Dashboard", layout="wide")
+
+# -----------------------------
+# USER-PROVIDED API KEY (embedded as requested)
+# -----------------------------
+# NOTE: For production prefer: st.secrets or environment variable.
+NEWSAPI_KEY = "0d9d845466e14187b52b8717c1eb993f"
 
 # -----------------------------
 # LAZY VADER INITIALIZATION
@@ -84,6 +91,8 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+st.title("💹 Stock Market News & Sentiment Dashboard")
+
 # -----------------------------
 # TIME FILTER
 # -----------------------------
@@ -103,6 +112,18 @@ elif time_period == "Last 3 Months":
 else:
     start_date = today - timedelta(days=180)
 
+# Performance knobs (kept as sidebar controls)
+max_results = st.sidebar.slider("Max articles per stock (fetch)", 10, 80, 40, step=5)
+workers = st.sidebar.slider("Concurrent fetch workers", 2, 8, 4, step=1)
+
+# Optional manual refresh
+if st.sidebar.button("🔁 Manual Refresh (clear caches)"):
+    try:
+        st.cache_data.clear()
+        st.success("Caches cleared")
+    except Exception:
+        st.warning("Unable to clear caches in this Streamlit version")
+
 # -----------------------------
 # F&O STOCK LIST
 # -----------------------------
@@ -115,37 +136,97 @@ fo_stocks = [
 ]
 
 # -----------------------------
-# CACHED NEWS FETCHER
+# UTILITIES: normalizer and numeric regex
 # -----------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_news(stock, start, end, max_results=40):
+NUMERIC_RE = re.compile(r'[%₹$£€]|\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b', re.IGNORECASE)
+
+def _normalize_article(raw: Dict[str, Any], source_name_hint: str = "GNews") -> Dict[str, Any]:
+    title = raw.get("title") or raw.get("headline") or ""
+    desc = raw.get("description") or raw.get("snippet") or raw.get("summary") or ""
+    url = raw.get("url") or raw.get("link") or raw.get("source_url") or raw.get("sourceUrl") or "#"
+    pub = ""
+    if isinstance(raw.get("publisher"), dict):
+        pub = raw["publisher"].get("title") or ""
+    elif raw.get("source"):
+        pub = raw.get("source")
+    elif raw.get("source_name"):
+        pub = raw.get("source_name")
+    else:
+        pub = source_name_hint
+    published = raw.get("published") or raw.get("published date") or raw.get("publishedAt") or ""
+    return {"title": title, "description": desc, "url": url, "publisher": {"title": pub}, "published": published, "raw": raw}
+
+# -----------------------------
+# RESILIENT FETCHERS: GNews primary, NewsAPI fallback
+# -----------------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_news(stock: str, start: datetime, end: datetime, max_results_local: int = 40) -> List[Dict[str, Any]]:
+    articles_out = []
+    # 1) Try GNews
     try:
-        g = GNews(language="en", country="IN", max_results=max_results)
-        g.start_date, g.end_date = start, end
-        articles = g.get_news(stock) or []
-
-        # Dedupe by normalized title
-        seen = set()
-        unique = []
-        for a in articles:
-            title = (a.get("title") or "").strip()
-            norm = re.sub(r"\W+", " ", title.lower()).strip()
-            key = norm[:150]
-            if key not in seen:
-                seen.add(key)
-                unique.append(a)
-        return unique
-
+        g = GNews(language="en", country="IN", max_results=max_results_local)
+        try:
+            g.start_date, g.end_date = start, end
+        except Exception:
+            pass
+        raw = g.get_news(stock) or []
+        for r in raw:
+            norm = _normalize_article(r, source_name_hint="GNews")
+            if norm["title"] and norm["url"]:
+                articles_out.append(norm)
     except Exception:
-        return []
+        articles_out = []
+
+    # 2) Fallback: NewsAPI
+    if (not articles_out) and NEWSAPI_KEY:
+        try:
+            q = f'"{stock}" OR {stock}'
+            params = {
+                "q": q,
+                "from": start.strftime("%Y-%m-%d"),
+                "to": end.strftime("%Y-%m-%d"),
+                "language": "en",
+                "sortBy": "relevancy",
+                "pageSize": max_results_local,
+                "apiKey": NEWSAPI_KEY
+            }
+            resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=12)
+            if resp.status_code == 200:
+                data = resp.json()
+                for a in data.get("articles", [])[:max_results_local]:
+                    raw_norm = {
+                        "title": a.get("title"),
+                        "description": a.get("description"),
+                        "url": a.get("url"),
+                        "publisher": {"title": (a.get("source") or {}).get("name") or "NewsAPI"},
+                        "published": a.get("publishedAt"),
+                        "raw": a
+                    }
+                    articles_out.append(raw_norm)
+        except Exception:
+            pass
+
+    # Final dedupe by normalized title
+    seen = set()
+    unique = []
+    for a in articles_out:
+        t = (a.get("title") or "").strip()
+        key = re.sub(r"\W+", " ", t.lower()).strip()[:150]
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(a)
+    return unique
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_all_news(stocks, start, end, max_results=40):
+def fetch_all_news(stocks: List[str], start: datetime, end: datetime, max_results_local: int = 40) -> List[Dict[str, Any]]:
     results = []
-    with ThreadPoolExecutor(max_workers=4) as exe:
-        tasks = {exe.submit(fetch_news, s, start, end, max_results): s for s in stocks}
-        for fut in as_completed(tasks):
-            stock = tasks[fut]
+    with ThreadPoolExecutor(max_workers=min(workers, 8)) as executor:
+        futures = {executor.submit(fetch_news, s, start, end, max_results_local): s for s in stocks}
+        for fut in as_completed(futures):
+            stock = futures[fut]
             try:
                 arts = fut.result() or []
                 results.append({"Stock": stock, "Articles": arts, "News Count": len(arts)})
@@ -154,8 +235,7 @@ def fetch_all_news(stocks, start, end, max_results=40):
     return results
 
 # -----------------------------
-# SCORING ENGINE
-# (UNCHANGED — your original logic preserved)
+# SCORING ENGINE (UNCHANGED)
 # -----------------------------
 WEIGHTS = {
     "earnings_guidance": 30, "M&A_JV": 25, "management_change": 20, "buyback_dividend": 20,
@@ -244,6 +324,72 @@ def score_article(title, desc, publisher, corroboration_sources=None):
     return score, reasons
 
 # -----------------------------
+# RBI NEWS FETCHER (adds RBI-specific policy/news)
+# -----------------------------
+RBI_KEYWORDS = [
+    "rbi","reserve bank of india","repo rate","policy rate","monetary policy","mpc","mpc meeting","m-pc","rbi governor",
+    "rate cut","rate hike","bank rate","cash reserve ratio","crr","statutory liquidity ratio","slr","inflation target",
+    "standing deposit facility"
+]
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_rbi_news(start: datetime, end: datetime, max_results_local: int = 50) -> List[Dict[str, Any]]:
+    out = []
+    # Try GNews for RBI terms
+    try:
+        g = GNews(language="en", country="IN", max_results=max_results_local)
+        try:
+            g.start_date, g.end_date = start, end
+        except Exception:
+            pass
+        raw = g.get_news("RBI") or g.get_news("Reserve Bank of India") or []
+        for r in raw:
+            norm = _normalize_article(r, source_name_hint="GNews")
+            title_l = (norm["title"] or "").lower()
+            desc_l = (norm["description"] or "").lower()
+            if any(k in title_l or k in desc_l for k in RBI_KEYWORDS):
+                out.append(norm)
+    except Exception:
+        out = []
+
+    # NewsAPI fallback for RBI
+    if NEWSAPI_KEY:
+        try:
+            params = {
+                "q": "RBI OR \"Reserve Bank of India\" OR repo OR mpc OR \"monetary policy\"",
+                "from": start.strftime("%Y-%m-%d"),
+                "to": end.strftime("%Y-%m-%d"),
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": max_results_local,
+                "apiKey": NEWSAPI_KEY
+            }
+            resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=12)
+            if resp.status_code == 200:
+                data = resp.json()
+                for a in data.get("articles", [])[:max_results_local]:
+                    title = a.get("title","") or ""
+                    desc = a.get("description","") or ""
+                    if any(k in title.lower() or k in desc.lower() for k in RBI_KEYWORDS):
+                        raw_norm = {"title": a.get("title"), "description": a.get("description"), "url": a.get("url"),
+                                    "publisher": {"title": (a.get("source") or {}).get("name") or "NewsAPI"}, "published": a.get("publishedAt"), "raw": a}
+                        out.append(raw_norm)
+        except Exception:
+            pass
+
+    # dedupe
+    final = []
+    seen = set()
+    for a in out:
+        t = (a.get("title") or "").strip()
+        key = re.sub(r"\W+", " ", t.lower()).strip()[:150]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        final.append(a)
+    return final
+
+# -----------------------------
 # SESSION STATE SETUP
 # -----------------------------
 st.session_state.setdefault("saved_articles", [])
@@ -252,10 +398,9 @@ st.session_state.setdefault("manual_events", [])
 # -----------------------------
 # INITIAL NEWS FETCH (lightweight - first 10 stocks)
 # -----------------------------
-# We fetch a smaller set on initial load to keep startup fast.
 initial_stocks = fo_stocks[:10]
 with st.spinner("Fetching latest financial news (light)..."):
-    raw_news_results = fetch_all_news(initial_stocks, start_date, today, max_results=20)
+    raw_news_results = fetch_all_news(initial_stocks, start_date, today, max_results_local=max_results)
 
 # Normalize publishers and build headline_map for corroboration (from the same results)
 news_results = []
@@ -286,6 +431,19 @@ for r in raw_news_results:
 
     news_results.append({"Stock": stock, "Articles": filtered, "News Count": len(filtered)})
 
+# ---- Append RBI news to news_results so it appears in News tab and in events
+try:
+    rbi_hits = fetch_rbi_news(start_date, today, max_results_local=max_results) or []
+    if rbi_hits:
+        news_results.insert(0, {"Stock": "RBI (Policy)", "Articles": rbi_hits, "News Count": len(rbi_hits)})
+        for art in rbi_hits:
+            title = art.get("title") or ""
+            norm_head = re.sub(r'\W+', " ", title.lower()).strip()
+            key = norm_head[:120] if norm_head else f"rbi_{(title or '')[:40]}"
+            headline_map.setdefault(key, []).append((art.get("publisher") or {}).get("title") or "RBI")
+except Exception:
+    pass
+
 # -----------------------------
 # TABS
 # -----------------------------
@@ -294,7 +452,7 @@ news_tab, trending_tab, sentiment_tab, events_tab = st.tabs(
 )
 
 # -----------------------------
-# TAB: NEWS
+# TAB: NEWS (keeps original UI and behavior)
 # -----------------------------
 with news_tab:
     st.header("🗞️ Latest Market News for F&O Stocks")
@@ -312,7 +470,7 @@ with news_tab:
     displayed_total = 0
     filtered_out_total = 0
 
-    # Use the fetched `news_results` (first 10 stocks). Full list is fetched on-demand in Trending.
+    # Use the fetched `news_results` (first 10 stocks + RBI). Full list is fetched on-demand in Trending.
     for res in news_results:
         stock = res.get("Stock", "Unknown")
         articles = res.get("Articles", []) or []
@@ -335,6 +493,13 @@ with news_tab:
             publishers_for_head = headline_map.get(key, [])
 
             score, reasons = score_article(title, desc, publisher, corroboration_sources=publishers_for_head)
+            # RBI boost: if the article mentions RBI keywords, boost the score to increase visibility
+            title_l = (title or "").lower()
+            desc_l = (desc or "").lower()
+            if any(k in title_l or k in desc_l for k in RBI_KEYWORDS):
+                score = min(100, score + 30)
+                reasons = reasons + ["RBI mention (boosted)"]
+
             scored_list.append({
                 "title": title,
                 "desc": desc,
@@ -410,7 +575,7 @@ with news_tab:
         st.info("No saved articles yet — click 💾 Save / Watch on any article card.")
 
 # -----------------------------
-# TAB: TRENDING (fixed & robust)
+# TAB: TRENDING (fixed & robust) - includes RBI implicitly via all_results if wanted
 # -----------------------------
 with trending_tab:
     st.header(f"🔥 Trending F&O Stocks — Impact from recent news ({time_period})")
@@ -422,7 +587,16 @@ with trending_tab:
 
     # Fetch full news for all F&O stocks (on-demand)
     with st.spinner("Calculating news impact across F&O stocks..."):
-        all_results = fetch_all_news(fo_stocks, start_date, today, max_results=40)
+        all_results = fetch_all_news(fo_stocks, start_date, today, max_results_local=max_results)
+
+    # Optionally fetch RBI hits and include them in all_results for Trending
+    try:
+        rbi_for_trending = fetch_rbi_news(start_date, today, max_results_local=max_results) or []
+        if rbi_for_trending:
+            # add as first element
+            all_results.insert(0, {"Stock": "RBI (Policy)", "Articles": rbi_for_trending, "News Count": len(rbi_for_trending)})
+    except Exception:
+        pass
 
     # Rebuild corroboration map from the same dataset
     headline_map_full = {}
@@ -464,6 +638,12 @@ with trending_tab:
             key = norm_head[:120] if norm_head else f"{stock.lower()}_{(title or '')[:40]}"
             pubs = headline_map_full.get(key, [])
             score, reasons = score_article(title, desc, publisher, corroboration_sources=pubs)
+            # RBI boost if RBI keyword present
+            title_l = (title or "").lower()
+            desc_l = (desc or "").lower()
+            if any(k in title_l or k in desc_l for k in RBI_KEYWORDS):
+                score = min(100, score + 30)
+                reasons = reasons + ["RBI mention (boosted)"]
             # accumulate
             sum_score += score
             if title:
@@ -483,30 +663,23 @@ with trending_tab:
 
     if df_metrics.empty or df_metrics["SumScore"].sum() == 0:
         st.info("No impactful news detected in the selected timeframe. Try increasing Max Articles or widening the time period.")
-        # show small debug table
         st.dataframe(df_metrics.head(10), use_container_width=True)
     else:
-        # Relative percent vs top
         top_val = df_metrics["SumScore"].max() if df_metrics["SumScore"].max() > 0 else 1
         df_metrics["Percent"] = (df_metrics["SumScore"] / top_val) * 100
         df_metrics["PercentLabel"] = df_metrics["Percent"].round(1).astype(str) + "%"
 
-        # Build combined bar + line chart
         fig = go.Figure()
-
-        # Bar = absolute summed score
         fig.add_trace(go.Bar(
             x=df_metrics["Stock"],
             y=df_metrics["SumScore"],
             name="Summed Impact Score",
-            text=df_metrics["PercentLabel"],          # show percent above each bar
-            textposition="outside",
+            text=df_metrics["PercentLabel"],
+            textposition='outside',
             marker=dict(line=dict(width=0.8, color='rgba(0,0,0,0.12)')),
             hovertemplate="<b>%{x}</b><br>Sum Score: %{y:.0f}<br>Articles: %{customdata[0]}<extra></extra>",
             customdata=df_metrics[["Count"]].values
         ))
-
-        # Line/markers = percent (secondary y-axis)
         fig.add_trace(go.Scatter(
             x=df_metrics["Stock"],
             y=df_metrics["Percent"],
@@ -517,8 +690,6 @@ with trending_tab:
             textposition="top center",
             hovertemplate="<b>%{x}</b><br>Relative: %{y:.1f}%<extra></extra>",
         ))
-
-        # Layout with secondary y-axis
         fig.update_layout(
             template=plot_theme,
             title=dict(text=f"Trending F&O Stocks — News Impact ({time_period})", x=0.5),
@@ -529,8 +700,6 @@ with trending_tab:
             margin=dict(t=80, b=140),
             height=520
         )
-
-        # Style: ensure text colors visible in dark mode
         if dark_mode:
             fig.update_traces(textfont=dict(color="#FFFFFF"))
             fig.update_layout(font=dict(color="#EAEAEA"))
@@ -540,7 +709,6 @@ with trending_tab:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # Summary table below
         st.subheader("📊 Market-impacting News Summary (top 20)")
         df_display = df_metrics[["Stock", "SumScore", "Count", "AvgScore", "Percent"]].copy()
         df_display["SumScore"] = df_display["SumScore"].round(1)
@@ -561,7 +729,6 @@ with sentiment_tab:
     st.header("💬 Sentiment Analysis")
     with st.spinner("Analyzing sentiment..."):
         sentiment_data = []
-        # We use first 10 stocks' results (fast)
         for res in raw_news_results:
             stock = res.get("Stock", "Unknown")
             for art in (res.get("Articles") or [])[:3]:
@@ -582,8 +749,6 @@ with sentiment_tab:
 # -----------------------------
 # PART C — Events tab, manual events, footer
 # -----------------------------
-
-# ---- Helpers for date parsing & event extraction ----
 from dateutil.parser import parse as dtparse
 
 EVENT_WINDOW_DAYS = 90
@@ -610,12 +775,10 @@ def try_parse_date(s):
     s = (s or "").strip()
     if not s:
         return None
-    # Try dateutil fuzzy parse
     try:
         dt = dtparse(s, fuzzy=True)
         return dt
     except Exception:
-        # fallback formats
         fmts = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y", "%b %d, %Y", "%B %d, %Y", "%d %b", "%d %B"]
         for f in fmts:
             try:
@@ -637,7 +800,7 @@ def text_for_search(art):
         parts.append(art.get("snippet"))
     return " ".join(parts or [""]).lower()
 
-# ---- Extract events from news_results (company/corporate events) ----
+# Extract events from news_results (company/corporate events)
 events = []
 for res in news_results:
     stock = res.get("Stock", "Unknown")
@@ -686,7 +849,6 @@ for res in news_results:
         for dt in found_dates:
             if not isinstance(dt, datetime):
                 continue
-            # Skip past dates and far future
             if dt.date() < datetime.now().date():
                 continue
             if (dt - datetime.now()).days > EVENT_WINDOW_DAYS:
@@ -748,7 +910,7 @@ for me in manual:
 
 events = sorted(events, key=lambda x: (x["date"] if isinstance(x["date"], datetime) else datetime.max))
 
-# ---- Events tab UI ----
+# Events tab UI
 with events_tab:
     st.subheader(f"📅 Upcoming Market-Moving Events (next {EVENT_WINDOW_DAYS} days) — {len(events)} found (from news)")
 
@@ -774,7 +936,7 @@ with events_tab:
     else:
         st.info("No upcoming company updates found from recent news. Add manually if needed.")
 
-    # ---- Manual Add Section ----
+    # Manual Add Section
     with st.expander("➕ Add manual event"):
         m_stock = st.text_input("Stock name / company")
         m_type = st.selectbox(
@@ -796,6 +958,6 @@ with events_tab:
             })
             st.success("Manual event added (session only). It will appear in Upcoming Events on next refresh.")
 
-# ---- FOOTER ----
+# FOOTER
 st.markdown("---")
-st.caption(f"📊 Data Source: Google News | Mode: {'Dark' if dark_mode else 'Light'} | Auto-refresh: session-cached | Built with Streamlit & Plotly")
+st.caption(f"📊 Data Source: Google News + NewsAPI (fallback) | Mode: {'Dark' if dark_mode else 'Light'} | Auto-refresh: session-cached | Built with Streamlit & Plotly")
