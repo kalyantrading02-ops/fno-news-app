@@ -724,127 +724,91 @@ with news_tab:
 with trending_tab:
     st.header(f"🔥 Trending F&O Stocks by Market-Impacting News — {time_period}")
 
-    # Choose threshold for "market-impacting" — change this number if you want stricter/looser filtering
-    impact_threshold = 40
+    impact_threshold = st.slider("Impact threshold (score)", 0, 100, 40)
+    st.caption("Lower the threshold to capture more items. Increase Max Articles per stock in sidebar to fetch more.")
 
-    with st.spinner("Fetching latest news and filtering for market-impacting items..."):
+    with st.spinner("Fetching news for trending calculation..."):
         # fetch raw news lists (deduped by fetch_news function)
-        all_results = fetch_all_news(fo_stocks, start_date, today)
+        all_results = fetch_all_news(fo_stocks, start_date, today, max_results=max_results)
 
-        # Build counts by counting only articles with score >= impact_threshold
-        counts = []
-        for res in all_results:
-            stock_name = res.get("Stock", "")
-            articles = res.get("Articles") or []
-            impactful_count = 0
-            for art in articles:
-                # prepare title/desc/publisher similar to News tab logic
-                title = art.get("title") or ""
-                desc = art.get("description") or art.get("snippet") or ""
-                pub_field = art.get("publisher")
-                if isinstance(pub_field, dict):
-                    publisher = pub_field.get("title") or ""
-                elif isinstance(pub_field, str):
-                    publisher = pub_field
-                else:
-                    publisher = art.get("source") or ""
+    # Rebuild headline_map from the SAME all_results to keep corroboration consistent
+    headline_map = {}
+    for res in all_results:
+        stock = res.get("Stock", "")
+        for art in res.get("Articles", []) or []:
+            title = art.get("title") or ""
+            norm_head = re.sub(r'\W+', " ", title.lower()).strip()
+            key = norm_head[:120] if norm_head else f"{stock.lower()}_{(title or '')[:40]}"
+            pub = art.get("publisher")
+            pub_name = ""
+            if isinstance(pub, dict):
+                pub_name = pub.get("title") or ""
+            elif isinstance(pub, str):
+                pub_name = pub
+            else:
+                pub_name = art.get("source") or ""
+            headline_map.setdefault(key, []).append(pub_name or "unknown")
 
-                # build headline key for corroboration lookup (reuse your headline_map)
-                norm_head = re.sub(r'\W+', " ", (title or "").lower()).strip()
-                key = norm_head[:120] if norm_head else f"{stock_name.lower()}_{(title or '')[:40]}"
-                publishers_for_head = headline_map.get(key, [])
+    # Build counts by counting only articles with score >= impact_threshold
+    counts = []
+    debug_samples = []  # collect examples to show if everything is zero
+    for res in all_results:
+        stock_name = res.get("Stock", "")
+        articles = res.get("Articles") or []
+        impactful_count = 0
 
-                # score article using your scoring engine; count if above threshold
-                score, reasons = score_article(title, desc, publisher, corroboration_sources=publishers_for_head)
-                if score >= impact_threshold:
-                    impactful_count += 1
+        for art in articles:
+            title = art.get("title") or ""
+            desc = art.get("description") or art.get("snippet") or ""
+            pub_field = art.get("publisher")
+            if isinstance(pub_field, dict):
+                publisher = pub_field.get("title") or ""
+            elif isinstance(pub_field, str):
+                publisher = pub_field
+            else:
+                publisher = art.get("source") or ""
 
-            counts.append({"Stock": stock_name, "News Count": int(impactful_count)})
+            # build headline key for corroboration lookup (we just rebuilt headline_map)
+            norm_head = re.sub(r'\W+', " ", (title or "").lower()).strip()
+            key = norm_head[:120] if norm_head else f"{stock_name.lower()}_{(title or '')[:40]}"
+            publishers_for_head = headline_map.get(key, [])
 
-        df_counts = pd.DataFrame(counts).sort_values("News Count", ascending=False).reset_index(drop=True)
+            score, reasons = score_article(title, desc, publisher, corroboration_sources=publishers_for_head)
+            if score >= impact_threshold:
+                impactful_count += 1
 
-    # If no data, show message
+            # collect a small sample for debugging
+            if len(debug_samples) < 6 and title:
+                debug_samples.append({"stock": stock_name, "title": title, "score": score, "publisher": publisher})
+
+        # Append exactly once per stock (bug fix)
+        counts.append({"Stock": stock_name, "News Count": int(impactful_count)})
+
+    df_counts = pd.DataFrame(counts).sort_values("News Count", ascending=False).reset_index(drop=True)
+
     if df_counts.empty:
-        st.info("No data available — try changing the time period or increasing max_results in fetcher.")
+        st.info("No data available — try increasing Max Articles (sidebar) or widening time period.")
     else:
-        # If everything is zero, show raw zeros; otherwise compute relative percent (top = 100%)
-        if df_counts["News Count"].sum() == 0:
-            df_counts["Label"] = df_counts["News Count"].astype(str)
-            y_field = "News Count"
-            hover_template_extra = "%{y}"
-            yaxis_title = "Market-impacting News Mentions (count)"
-        else:
-            top_value = df_counts["News Count"].max() if df_counts["News Count"].max() > 0 else 1
-            df_counts["Percent"] = (df_counts["News Count"] / top_value) * 100
-            df_counts["Label"] = df_counts["Percent"].round(1).astype(str) + "%"
-            y_field = "Percent"
-            hover_template_extra = "%{y:.1f}%"
-            yaxis_title = "Relative Popularity (%) (top = 100%)"
-
-        # Palette (one color per bar); change to single color by replacing colors list if desired
-        palette = ["#0078FF", "#00C853", "#EF5350", "#9C27B0", "#FF9800", "#00BCD4", "#8BC34A", "#9E9E9E"]
-        colors = [palette[i % len(palette)] for i in range(len(df_counts))]
-
-        # Build Plotly bar chart
+        # Show simple bar chart of counts (absolute)
         fig = go.Figure()
         fig.add_trace(go.Bar(
             x=df_counts["Stock"],
-            y=df_counts[y_field],
-            marker=dict(color=colors, line=dict(color='rgba(0,0,0,0.4)', width=1.25)),
-            text=df_counts["Label"],
-            textposition='outside',
-            hovertemplate='<b>%{x}</b><br>Value: ' + hover_template_extra + '<extra></extra>',
+            y=df_counts["News Count"],
+            text=df_counts["News Count"],
+            textposition='outside'
         ))
-
-        # Layout & style
-        fig.update_layout(
-            template=plot_theme,
-            title=dict(text=f"Trending F&O Stocks (market-impacting news only) — {time_period}", x=0.5, xanchor='center', font=dict(size=18)),
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            margin=dict(t=70, l=60, r=40, b=120),
-            height=520,
-        )
-
-        fig.update_xaxes(tickangle=-35, tickfont=dict(size=11), showgrid=False, zeroline=False)
-        fig.update_yaxes(showgrid=True, gridcolor='rgba(255,255,255,0.08)', tickfont=dict(size=12), title_text=yaxis_title, rangemode="tozero")
-
-        fig.update_traces(textfont=dict(size=12, color="#ffffff" if dark_mode else "#111111"), cliponaxis=False)
-
-        if dark_mode:
-            fig.update_layout(font=dict(color="#EAEAEA"))
-        else:
-            fig.update_layout(font=dict(color="#111111"))
-
-        # Render chart and table
+        fig.update_layout(template=plot_theme, title_text=f"Trending F&O Stocks (market-impacting news only) — {time_period}", xaxis_tickangle=-35, height=520)
         st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("📊 Market-impacting News Summary")
+        st.dataframe(df_counts, use_container_width=True)
 
-df_display = df_counts[["Stock", "News Count"]].copy()
-if y_field == "Percent":
-    df_display["Percent"] = df_counts["Percent"].round(1)
-
-# ✅ Center only the numeric columns (News Count and Percent)
-st.dataframe(
-    df_display.style.set_properties(
-        subset=["News Count"] + (["Percent"] if "Percent" in df_display.columns else []),
-        **{"text-align": "center"}
-    ),
-    use_container_width=True
-)
-
-# 🟢 Top trending stocks (market-impacting only)
-top_nonzero = df_counts[df_counts["News Count"] > 0].head(3)
-if not top_nonzero.empty:
-    st.success(
-        f"🚀 Top Trending (market-impacting): {', '.join(top_nonzero['Stock'].tolist())}"
-    )
-    st.caption(
-        f"Showing articles with score ≥ {impact_threshold}. Adjust `impact_threshold` in the code to tune sensitivity."
-    )
-else:
-    st.info("No market-impacting news found in the selected timeframe (all counts are 0).")
+        # If all counts are zero, show debugging samples
+        if df_counts["News Count"].sum() == 0:
+            st.warning("All counts are zero. Possible causes: low max_results, strict impact threshold, or no articles returned by the fetcher.")
+            st.markdown("**Debug sample headlines (score):**")
+            for d in debug_samples:
+                st.markdown(f"- **{d['stock']}** — {d['title'][:120]} — *score {d['score']}* — _{d['publisher']}_")
 
 # -----------------------------
 # TAB 3 — SENTIMENT (unchanged)
