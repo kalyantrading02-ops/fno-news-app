@@ -585,32 +585,35 @@ with trending_tab:
         "Bars = summed impact score (higher = more/stronger signals). Line = relative effect vs top stock (top = 100%)."
     )
 
-    # Fetch full news for all F&O stocks (on-demand) with guarded error handling
+    # Fetch full news for all F&O stocks (on-demand) with guarded calling of fetch_all_news
     with st.spinner("Calculating news impact across F&O stocks..."):
         try:
             max_workers_local = min(workers if "workers" in globals() else 4, 8)
-            all_results = fetch_all_news(
-                fo_stocks,
-                start_date,
-                today,
-                max_results=max_results,
-                max_workers=max_workers_local
-            )
+            # Try multiple positional-call variants to match whatever signature your fetch_all_news has.
+            try:
+                # Preferred: (stocks, start, end, max_results, max_workers)
+                all_results = fetch_all_news(fo_stocks, start_date, today, max_results, max_workers_local)
+            except TypeError:
+                try:
+                    # Common variant: (stocks, start, end, max_results)
+                    all_results = fetch_all_news(fo_stocks, start_date, today, max_results)
+                except TypeError:
+                    try:
+                        # Older variant: (stocks, start, end)
+                        all_results = fetch_all_news(fo_stocks, start_date, today)
+                    except TypeError:
+                        # Fallback: some implementations accept only (stocks,)
+                        try:
+                            all_results = fetch_all_news(fo_stocks)
+                        except Exception as inner:
+                            raise RuntimeError(f"fetch_all_news has an unsupported signature: {str(inner)[:200]}")
         except Exception as e:
             st.error("Unable to fetch news for Trending chart. See logs for details.")
             st.warning(str(e)[:300])
+            # fallback: empty list so UI continues to render
             all_results = [{"Stock": s, "Articles": [], "News Count": 0} for s in fo_stocks]
 
-    # Optionally include RBI policy hits in the trending aggregation (non-fatal)
-    try:
-        if "fetch_rbi_news" in globals():
-            rbi_for_trending = fetch_rbi_news(start_date, today, max_results_local=max_results) or []
-            if rbi_for_trending:
-                all_results.insert(0, {"Stock": "RBI (Policy)", "Articles": rbi_for_trending, "News Count": len(rbi_for_trending)})
-    except Exception as e:
-        st.warning(f"RBI fetch error: {str(e)[:200]}")
-
-    # Build corroboration headline map from fetched data
+    # Build corroboration headline map from fetched data (no RBI insertion)
     headline_map_full = {}
     for res in all_results:
         stock = res.get("Stock", "")
@@ -651,17 +654,6 @@ with trending_tab:
             key = norm_head[:120] if norm_head else f"{stock.lower()}_{(title or '')[:40]}"
             pubs = headline_map_full.get(key, [])
             score, reasons = score_article(title, desc, publisher, corroboration_sources=pubs)
-
-            # apply RBI boost if RBI-related keywords appear
-            try:
-                if "RBI_KEYWORDS" in globals():
-                    title_l = (title or "").lower()
-                    desc_l = (desc or "").lower()
-                    if any(k in title_l or k in desc_l for k in RBI_KEYWORDS):
-                        score = min(100, score + 30)
-                        reasons = reasons + ["RBI mention (boosted)"]
-            except Exception:
-                pass
 
             sum_score += float(score)
             if title:
@@ -750,30 +742,6 @@ with trending_tab:
             "AvgScore": "Avg per Article",
             "Percent": "Relative (%)"
         }), use_container_width=True)
-
-# -----------------------------
-# TAB: SENTIMENT
-# -----------------------------
-with sentiment_tab:
-    st.header("💬 Sentiment Analysis")
-    with st.spinner("Analyzing sentiment..."):
-        sentiment_data = []
-        for res in raw_news_results:
-            stock = res.get("Stock", "Unknown")
-            for art in (res.get("Articles") or [])[:3]:
-                title = art.get("title") or ""
-                desc = art.get("description") or art.get("snippet") or ""
-                combined = f"{title}. {desc}"
-                s_label, emoji, s_score = analyze_sentiment(combined)
-                sentiment_data.append({"Stock": stock, "Headline": title, "Sentiment": s_label, "Emoji": emoji, "Score": s_score})
-
-        if sentiment_data:
-            sentiment_df = pd.DataFrame(sentiment_data).sort_values(by=["Stock", "Score"], ascending=[True, False])
-            st.dataframe(sentiment_df, use_container_width=True)
-            csv_bytes = sentiment_df.to_csv(index=False).encode("utf-8")
-            st.download_button("📥 Download Sentiment Data", csv_bytes, "sentiment_data.csv", "text/csv")
-        else:
-            st.warning("No sentiment data found for the selected timeframe.")
 
 # -----------------------------
 # PART C — Events tab, manual events, footer
