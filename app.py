@@ -585,35 +585,37 @@ with trending_tab:
         "Bars = summed impact score (higher = more/stronger signals). Line = relative effect vs top stock (top = 100%)."
     )
 
-    # Fetch full news for all F&O stocks (on-demand) with guarded calling of fetch_all_news
-    with st.spinner("Calculating news impact across F&O stocks..."):
-        try:
-            max_workers_local = min(workers if "workers" in globals() else 4, 8)
-            # Try multiple positional-call variants to match whatever signature your fetch_all_news has.
-            try:
-                # Preferred: (stocks, start, end, max_results, max_workers)
-                all_results = fetch_all_news(fo_stocks, start_date, today, max_results, max_workers_local)
-            except TypeError:
-                try:
-                    # Common variant: (stocks, start, end, max_results)
-                    all_results = fetch_all_news(fo_stocks, start_date, today, max_results)
-                except TypeError:
-                    try:
-                        # Older variant: (stocks, start, end)
-                        all_results = fetch_all_news(fo_stocks, start_date, today)
-                    except TypeError:
-                        # Fallback: some implementations accept only (stocks,)
-                        try:
-                            all_results = fetch_all_news(fo_stocks)
-                        except Exception as inner:
-                            raise RuntimeError(f"fetch_all_news has an unsupported signature: {str(inner)[:200]}")
-        except Exception as e:
-            st.error("Unable to fetch news for Trending chart. See logs for details.")
-            st.warning(str(e)[:300])
-            # fallback: empty list so UI continues to render
-            all_results = [{"Stock": s, "Articles": [], "News Count": 0} for s in fo_stocks]
+    # Use cached aggregated results (fast). If not present, do a light fetch for UI responsiveness.
+    all_results = st.session_state.get("all_results_cache")
+    cache_meta = st.session_state.get("last_applied_filters")
 
-    # Build corroboration headline map from fetched data (no RBI insertion)
+    # If user changed filters since last apply, prompt to press Apply Filters
+    current_filter_key = {
+        "time_period": time_period,
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "max_results": max_results,
+        "workers": workers
+    }
+    if cache_meta and any(cache_meta.get(k) != current_filter_key.get(k) for k in ["time_period", "start_date", "max_results", "workers"]):
+        st.info("Cache is for a previous filter set. Press **Apply Filters** to refresh news for the selected timeframe / settings.")
+
+    if not all_results:
+        # Light fetch for quick rendering (first 10 stocks only)
+        with st.spinner("Loading a light snapshot for Trending (use Apply Filters to fetch full data)..."):
+            try:
+                initial_stocks = fo_stocks[:10]
+                try:
+                    all_results = fetch_all_news(initial_stocks, start_date, today, max_results=10, max_workers=2)
+                except TypeError:
+                    # signature fallbacks
+                    try:
+                        all_results = fetch_all_news(initial_stocks, start_date, today, 10)
+                    except Exception:
+                        all_results = fetch_all_news(initial_stocks, start_date, today)
+            except Exception:
+                all_results = [{"Stock": s, "Articles": [], "News Count": 0} for s in initial_stocks]
+
+    # Build corroboration headline map from fetched data
     headline_map_full = {}
     for res in all_results:
         stock = res.get("Stock", "")
@@ -638,7 +640,6 @@ with trending_tab:
         articles = res.get("Articles") or []
         sum_score = 0.0
         count = 0
-        sample_titles = []
         for art in articles:
             title = art.get("title") or ""
             desc = art.get("description") or art.get("snippet") or ""
@@ -656,8 +657,6 @@ with trending_tab:
             score, reasons = score_article(title, desc, publisher, corroboration_sources=pubs)
 
             sum_score += float(score)
-            if title:
-                sample_titles.append({"title": title, "score": score, "publisher": publisher})
             count += 1
 
         avg_score = (sum_score / count) if count else 0.0
@@ -666,38 +665,29 @@ with trending_tab:
             "SumScore": float(sum_score),
             "Count": int(count),
             "AvgScore": float(round(avg_score, 2)),
-            "Samples": sample_titles[:3]
         })
 
     df_metrics = pd.DataFrame(metrics).sort_values("SumScore", ascending=False).reset_index(drop=True)
 
-    # If no data -> friendly info and small table
     if df_metrics.empty or df_metrics["SumScore"].sum() == 0:
-        st.info("No impactful news detected in the selected timeframe. Try increasing Max Articles or widening the time period.")
-        st.dataframe(df_metrics.head(10), use_container_width=True)
-
+        st.info("No impactful news detected for the current dataset. Use 'Apply Filters' to fetch the full dataset for this timeframe.")
+        st.dataframe(df_metrics.head(20), use_container_width=True)
     else:
-        # Compute relative percent (top == 100%)
-        top_val = df_metrics["SumScore"].max() if df_metrics["SumScore"].max() > 0 else 1.0
-        df_metrics["Percent"] = (df_metrics["SumScore"] / top_val) * 100.0
+        top_val = df_metrics["SumScore"].max() if df_metrics["SumScore"].max() > 0 else 1
+        df_metrics["Percent"] = (df_metrics["SumScore"] / top_val) * 100
         df_metrics["PercentLabel"] = df_metrics["Percent"].round(1).astype(str) + "%"
 
-        # Build combined bar + line chart (single percent label above bar; line shows markers only)
+        # Chart: bar (percent label above bar) + line markers (no duplicate text)
         fig = go.Figure()
-
-        # Bar: show percent label above bar (single label)
         fig.add_trace(go.Bar(
             x=df_metrics["Stock"],
             y=df_metrics["SumScore"],
             name="Summed Impact Score",
-            text=df_metrics["PercentLabel"],          # percent label appears only here
+            text=df_metrics["PercentLabel"],
             textposition="outside",
-            marker=dict(line=dict(width=0.8, color='rgba(0,0,0,0.12)')),
+            customdata=df_metrics[["Count"]].values,
             hovertemplate="<b>%{x}</b><br>Sum Score: %{y:.0f}<br>Articles: %{customdata[0]}<extra></extra>",
-            customdata=df_metrics[["Count"]].values
         ))
-
-        # Line/markers: percent (no duplicate text)
         fig.add_trace(go.Scatter(
             x=df_metrics["Stock"],
             y=df_metrics["Percent"],
@@ -707,21 +697,16 @@ with trending_tab:
             marker=dict(size=8),
             hovertemplate="<b>%{x}</b><br>Relative: %{y:.1f}%<extra></extra>",
         ))
-
-        # Layout with secondary y-axis
         fig.update_layout(
             template=plot_theme,
             title=dict(text=f"Trending F&O Stocks — News Impact ({time_period})", x=0.5),
             xaxis=dict(tickangle=-35),
             yaxis=dict(title="Summed Impact Score", rangemode="tozero"),
             yaxis2=dict(title="Relative Effect (%)", overlaying="y", side="right",
-                        range=[0, max(110.0, df_metrics["Percent"].max() * 1.15)]),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        range=[0, max(110, df_metrics["Percent"].max() * 1.15)]),
             margin=dict(t=80, b=140),
             height=520
         )
-
-        # Ensure percent label color adjusts to theme (only for bar text)
         if dark_mode:
             fig.update_traces(selector=dict(type='bar'), textfont=dict(color="#FFFFFF"))
             fig.update_layout(font=dict(color="#EAEAEA"))
@@ -731,8 +716,7 @@ with trending_tab:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # Summary table
-        st.subheader("📊 Market-impacting News Summary (top 20)")
+        st.subheader("📊 Market-impacting News Summary")
         df_display = df_metrics[["Stock", "SumScore", "Count", "AvgScore", "Percent"]].copy()
         df_display["SumScore"] = df_display["SumScore"].round(1)
         df_display["Percent"] = df_display["Percent"].round(1)
