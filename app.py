@@ -589,24 +589,25 @@ with trending_tab:
     with st.spinner("Calculating news impact across F&O stocks..."):
         try:
             max_workers_local = min(workers if "workers" in globals() else 4, 8)
-            # fetch_all_news is the non-cached concurrent aggregator (must exist in your file)
-            all_results = fetch_all_news(fo_stocks, start_date, today, max_results=max_results, max_workers=max_workers_local)
+            all_results = fetch_all_news(
+                fo_stocks,
+                start_date,
+                today,
+                max_results=max_results,
+                max_workers=max_workers_local
+            )
         except Exception as e:
             st.error("Unable to fetch news for Trending chart. See logs for details.")
             st.warning(str(e)[:300])
-            # fallback: empty results (so UI continues to work)
             all_results = [{"Stock": s, "Articles": [], "News Count": 0} for s in fo_stocks]
 
     # Optionally include RBI policy hits in the trending aggregation (non-fatal)
     try:
-        rbi_for_trending = []
         if "fetch_rbi_news" in globals():
             rbi_for_trending = fetch_rbi_news(start_date, today, max_results_local=max_results) or []
-        if rbi_for_trending:
-            # insert RBI policy as first element so it appears in the chart
-            all_results.insert(0, {"Stock": "RBI (Policy)", "Articles": rbi_for_trending, "News Count": len(rbi_for_trending)})
+            if rbi_for_trending:
+                all_results.insert(0, {"Stock": "RBI (Policy)", "Articles": rbi_for_trending, "News Count": len(rbi_for_trending)})
     except Exception as e:
-        # non-blocking: just log and continue
         st.warning(f"RBI fetch error: {str(e)[:200]}")
 
     # Build corroboration headline map from fetched data
@@ -653,11 +654,12 @@ with trending_tab:
 
             # apply RBI boost if RBI-related keywords appear
             try:
-                title_l = (title or "").lower()
-                desc_l = (desc or "").lower()
-                if any(k in title_l or k in desc_l for k in (RBI_KEYWORDS if "RBI_KEYWORDS" in globals() else [])):
-                    score = min(100, score + 30)
-                    reasons = reasons + ["RBI mention (boosted)"]
+                if "RBI_KEYWORDS" in globals():
+                    title_l = (title or "").lower()
+                    desc_l = (desc or "").lower()
+                    if any(k in title_l or k in desc_l for k in RBI_KEYWORDS):
+                        score = min(100, score + 30)
+                        reasons = reasons + ["RBI mention (boosted)"]
             except Exception:
                 pass
 
@@ -677,7 +679,7 @@ with trending_tab:
 
     df_metrics = pd.DataFrame(metrics).sort_values("SumScore", ascending=False).reset_index(drop=True)
 
-    # If no data -> friendly info
+    # If no data -> friendly info and small table
     if df_metrics.empty or df_metrics["SumScore"].sum() == 0:
         st.info("No impactful news detected in the selected timeframe. Try increasing Max Articles or widening the time period.")
         st.dataframe(df_metrics.head(10), use_container_width=True)
