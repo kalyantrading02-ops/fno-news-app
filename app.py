@@ -1,3 +1,4 @@
+# app.py
 import os
 import time
 import re
@@ -86,6 +87,7 @@ st.markdown(
         color: {text_color} !important;
       }}
       h1, h2, h3, h4 {{ color: {accent_color} !important; }}
+      .stButton button {{ border-radius: 6px; }}
     </style>
     """,
     unsafe_allow_html=True
@@ -123,6 +125,9 @@ if st.sidebar.button("🔁 Manual Refresh (clear caches)"):
         st.success("Caches cleared")
     except Exception:
         st.warning("Unable to clear caches in this Streamlit version")
+    # clear session results cache too
+    st.session_state.pop("all_results_cache", None)
+    st.session_state.pop("last_applied_filters", None)
 
 # -----------------------------
 # F&O STOCK LIST
@@ -161,6 +166,9 @@ def _normalize_article(raw: Dict[str, Any], source_name_hint: str = "GNews") -> 
 # -----------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_news(stock: str, start: datetime, end: datetime, max_results_local: int = 40) -> List[Dict[str, Any]]:
+    """
+    Per-stock fetch. Cached to avoid repeated network calls for the same stock/time-window.
+    """
     articles_out = []
     # 1) Try GNews
     try:
@@ -220,18 +228,29 @@ def fetch_news(stock: str, start: datetime, end: datetime, max_results_local: in
         unique.append(a)
     return unique
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_all_news(stocks: List[str], start: datetime, end: datetime, max_results_local: int = 40) -> List[Dict[str, Any]]:
+def fetch_all_news(stocks: List[str], start: datetime, end: datetime, max_results_local: int = 40, max_workers: int = 4) -> List[Dict[str, Any]]:
+    """
+    Concurrently fetch news for a list of stocks.
+    This function is intentionally NOT cached (aggregated results may vary by filter).
+    Accepts both positional and keyword usages matching calls elsewhere.
+    """
     results = []
-    with ThreadPoolExecutor(max_workers=min(workers, 8)) as executor:
-        futures = {executor.submit(fetch_news, s, start, end, max_results_local): s for s in stocks}
-        for fut in as_completed(futures):
-            stock = futures[fut]
-            try:
-                arts = fut.result() or []
-                results.append({"Stock": stock, "Articles": arts, "News Count": len(arts)})
-            except Exception:
-                results.append({"Stock": stock, "Articles": [], "News Count": 0})
+    worker_count = min(max_workers, max(1, len(stocks)))
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {executor.submit(fetch_news, s, start, end, max_results_local): s for s in stocks}
+            for fut in as_completed(futures):
+                stock = futures[fut]
+                try:
+                    arts = fut.result() or []
+                    results.append({"Stock": stock, "Articles": arts, "News Count": len(arts)})
+                except Exception as e:
+                    # log to Streamlit UI for visibility; continue
+                    st.warning(f"Error fetching news for {stock}: {str(e)[:200]}")
+                    results.append({"Stock": stock, "Articles": [], "News Count": 0})
+    except Exception as e:
+        st.error(f"fetch_all_news fatal error: {str(e)[:300]}")
+        return [{"Stock": s, "Articles": [], "News Count": 0} for s in stocks]
     return results
 
 # -----------------------------
@@ -394,13 +413,24 @@ def fetch_rbi_news(start: datetime, end: datetime, max_results_local: int = 50) 
 # -----------------------------
 st.session_state.setdefault("saved_articles", [])
 st.session_state.setdefault("manual_events", [])
+# optional cached aggregated results (not required but helpful)
+# We don't auto-fill it here to keep behavior consistent; left for manual workflows if needed
+# st.session_state.setdefault("all_results_cache", None)
+# st.session_state.setdefault("last_applied_filters", None)
 
 # -----------------------------
 # INITIAL NEWS FETCH (lightweight - first 10 stocks)
 # -----------------------------
 initial_stocks = fo_stocks[:10]
 with st.spinner("Fetching latest financial news (light)..."):
-    raw_news_results = fetch_all_news(initial_stocks, start_date, today, max_results_local=max_results)
+    try:
+        raw_news_results = fetch_all_news(initial_stocks, start_date, today, max_results_local=max_results)
+    except TypeError:
+        # support alternate signatures if any other code called fetch_all_news differently
+        raw_news_results = fetch_all_news(initial_stocks, start_date, today, max_results_local)
+    except Exception as e:
+        st.warning(f"Initial lightweight fetch failed: {str(e)[:200]}")
+        raw_news_results = [{"Stock": s, "Articles": [], "News Count": 0} for s in initial_stocks]
 
 # Normalize publishers and build headline_map for corroboration (from the same results)
 news_results = []
@@ -431,7 +461,7 @@ for r in raw_news_results:
 
     news_results.append({"Stock": stock, "Articles": filtered, "News Count": len(filtered)})
 
-# ---- Append RBI news to news_results so it appears in News tab and in events
+# ---- Append RBI news to news_results so it appears in News tab and in events (preserve original feature)
 try:
     rbi_hits = fetch_rbi_news(start_date, today, max_results_local=max_results) or []
     if rbi_hits:
@@ -575,7 +605,7 @@ with news_tab:
         st.info("No saved articles yet — click 💾 Save / Watch on any article card.")
 
 # -----------------------------
-# TAB: TRENDING (fixed & robust) - includes RBI implicitly via all_results if wanted
+# TAB: TRENDING (fixed & robust) - includes RBI implicitly via news_results if present
 # -----------------------------
 with trending_tab:
     st.header(f"🔥 Trending F&O Stocks — News Impact ({time_period})")
@@ -585,29 +615,19 @@ with trending_tab:
         "Bars = summed impact score (higher = more/stronger signals). Line = relative effect vs top stock (top = 100%)."
     )
 
-    # Use cached aggregated results (fast). If not present, do a light fetch for UI responsiveness.
+    # Use cached aggregated results (if previously stored) otherwise do a light fetch for UI responsiveness
     all_results = st.session_state.get("all_results_cache")
     cache_meta = st.session_state.get("last_applied_filters")
 
-    # If user changed filters since last apply, prompt to press Apply Filters
-    current_filter_key = {
-        "time_period": time_period,
-        "start_date": start_date.strftime("%Y-%m-%d"),
-        "max_results": max_results,
-        "workers": workers
-    }
-    if cache_meta and any(cache_meta.get(k) != current_filter_key.get(k) for k in ["time_period", "start_date", "max_results", "workers"]):
-        st.info("Cache is for a previous filter set. Press **Apply Filters** to refresh news for the selected timeframe / settings.")
-
+    # If no cached aggregated results, do a light fetch (first 10) so the tab renders quickly
     if not all_results:
-        # Light fetch for quick rendering (first 10 stocks only)
-        with st.spinner("Loading a light snapshot for Trending (use Apply Filters to fetch full data)..."):
+        with st.spinner("Loading a light snapshot for Trending (expand to fetch full dataset)..."):
             try:
                 initial_stocks = fo_stocks[:10]
                 try:
-                    all_results = fetch_all_news(initial_stocks, start_date, today, max_results=10, max_workers=2)
+                    all_results = fetch_all_news(initial_stocks, start_date, today, max_results_local=10, max_workers=2)
                 except TypeError:
-                    # signature fallbacks
+                    # try signature fallback
                     try:
                         all_results = fetch_all_news(initial_stocks, start_date, today, 10)
                     except Exception:
@@ -670,7 +690,7 @@ with trending_tab:
     df_metrics = pd.DataFrame(metrics).sort_values("SumScore", ascending=False).reset_index(drop=True)
 
     if df_metrics.empty or df_metrics["SumScore"].sum() == 0:
-        st.info("No impactful news detected for the current dataset. Use 'Apply Filters' to fetch the full dataset for this timeframe.")
+        st.info("No impactful news detected for the current dataset. Use 'Apply Filters' (if you added) or broaden the timeperiod.")
         st.dataframe(df_metrics.head(20), use_container_width=True)
     else:
         top_val = df_metrics["SumScore"].max() if df_metrics["SumScore"].max() > 0 else 1
@@ -683,7 +703,7 @@ with trending_tab:
             x=df_metrics["Stock"],
             y=df_metrics["SumScore"],
             name="Summed Impact Score",
-            text=df_metrics["PercentLabel"],
+            text=df_metrics["PercentLabel"],        # percent label only on bars
             textposition="outside",
             customdata=df_metrics[["Count"]].values,
             hovertemplate="<b>%{x}</b><br>Sum Score: %{y:.0f}<br>Articles: %{customdata[0]}<extra></extra>",
@@ -693,7 +713,7 @@ with trending_tab:
             y=df_metrics["Percent"],
             name="Relative Effect (%)",
             yaxis="y2",
-            mode="lines+markers",
+            mode="lines+markers",                   # no text on line (avoids duplicate percent text)
             marker=dict(size=8),
             hovertemplate="<b>%{x}</b><br>Relative: %{y:.1f}%<extra></extra>",
         ))
@@ -726,6 +746,58 @@ with trending_tab:
             "AvgScore": "Avg per Article",
             "Percent": "Relative (%)"
         }), use_container_width=True)
+
+# -----------------------------
+# TAB: SENTIMENT (restored)
+# -----------------------------
+with sentiment_tab:
+    st.header("💬 Sentiment Analysis")
+
+    # Use cached aggregated results first (fast). If not present, do a light fetch snapshot.
+    all_results = st.session_state.get("all_results_cache")
+    if not all_results:
+        # Try to reuse raw_news_results produced earlier (light fetch). Otherwise do a lightweight fetch of first 10 stocks.
+        all_results = st.session_state.get("all_results_cache") or (raw_news_results if 'raw_news_results' in globals() else None)
+        if not all_results:
+            with st.spinner("Loading a quick sentiment snapshot (press Apply Filters for full data)..."):
+                try:
+                    initial_stocks = fo_stocks[:10]
+                    try:
+                        all_results = fetch_all_news(initial_stocks, start_date, today, max_results_local=10, max_workers=2)
+                    except TypeError:
+                        # signature fallback variants
+                        try:
+                            all_results = fetch_all_news(initial_stocks, start_date, today, 10)
+                        except Exception:
+                            all_results = fetch_all_news(initial_stocks, start_date, today)
+                except Exception:
+                    all_results = []
+
+    # Compute sentiment for headlines (small sample per stock)
+    with st.spinner("Analyzing sentiment..."):
+        sentiment_rows = []
+        for res in all_results:
+            stock = res.get("Stock", "")
+            for art in (res.get("Articles") or [])[:3]:
+                title = art.get("title") or ""
+                desc = art.get("description") or art.get("snippet") or ""
+                combined = f"{title}. {desc}"
+                s_label, emoji, s_score = analyze_sentiment(combined)
+                sentiment_rows.append({
+                    "Stock": stock,
+                    "Headline": title,
+                    "Sentiment": s_label,
+                    "Emoji": emoji,
+                    "Score": s_score
+                })
+
+        if sentiment_rows:
+            sentiment_df = pd.DataFrame(sentiment_rows).sort_values(by=["Stock", "Score"], ascending=[True, False])
+            st.dataframe(sentiment_df, use_container_width=True)
+            csv_bytes = sentiment_df.to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Download Sentiment Data", csv_bytes, "sentiment_data.csv", "text/csv")
+        else:
+            st.warning("No sentiment data available for the current dataset. Press 'Apply Filters' (if added) to fetch full data for the selected timeframe.")
 
 # -----------------------------
 # PART C — Events tab, manual events, footer
@@ -902,7 +974,7 @@ with events_tab:
             try:
                 initial_stocks = fo_stocks[:10]
                 try:
-                    all_results = fetch_all_news(initial_stocks, start_date, today, max_results=10, max_workers=2)
+                    all_results = fetch_all_news(initial_stocks, start_date, today, max_results_local=10, max_workers=2)
                 except TypeError:
                     all_results = fetch_all_news(initial_stocks, start_date, today, 10)
             except Exception:
@@ -1037,7 +1109,7 @@ with events_tab:
             date_str = e["date"].strftime("%Y-%m-%d") if isinstance(e["date"], datetime) else str(e["date"])
             st.markdown(f"- **{e['stock']}** — *{e['type'].title()}* on **{date_str}** — *{e['priority']}* — [{e['source']}]({e['url']})")
     else:
-        st.info("No upcoming company updates found from recent news in cache. Press 'Apply Filters' to fetch full data if needed.")
+        st.info("No upcoming company updates found from recent news in cache. Press 'Apply Filters' (if implemented) to fetch full data if needed.")
 
 # FOOTER
 st.markdown("---")
